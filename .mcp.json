@@ -1,0 +1,1 @@
+{"mcpServers":{"muse-bridge":{"args":["${CLAUDE_PLUGIN_ROOT}/servers/bridge/bridge_mcp.py"],"command":"python","env":{}}}}

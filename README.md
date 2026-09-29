@@ -1,75 +1,48 @@
-# muse-bridge
+# muse-bridge plugin v2
 
-Delegate Claude Code tasks to **Muse subagents** and get the results back in
-your Claude Code session. Your PC's Claude Code submits work; your Muse (in the
-cloud) runs it on real subagents and drops the results back.
+Claude Code 플러그인: home의 Claude Code가 Muse VM에서 도는 서브에이전트에게
+작업을 위임하는 브릿지.
+
+## 구성
 
 ```
-Claude Code (your PC)  --queue.json-->  Muse VM  --subagents-->  results
-        ^                                                      |
-        └─────────────── muse_result / muse_await ─────────────┘
+muse-bridge/
+  .claude-plugin/plugin.json   플러그인 매니페스트
+  .mcp.json                    MCP 서버 선언 (muse-bridge)
+  servers/bridge/bridge_mcp.py MCP 서버 (stdio)
+  skills/muse-delegate/        위임 방법 스킬 (자동 로드)
+  commands/muse.md             /muse-bridge:muse — 위임+폴링
+  commands/muse-status.md      /muse-bridge:status — 상태 조회
 ```
 
-- **Real-time dispatch, zero idle cost.** A 10-second file watcher (one SSH
-  call, no LLM) wakes a dispatcher only when new work arrives. No polling
-  loop burns tokens while idle.
-- **On-demand workers.** One worker per task, spawned when needed, exits when
-  done. Up to 8 concurrent.
-- **Home-file workspace.** Workers edit your real files via backup + audit
-  log (`bw.py ws-*`), never blind overwrites.
+## MCP 도구
 
-## Contents
+- `muse_submit(prompt, label="", workers=1, worker_instructions="", priority=0, timeout_minutes=60)`
+  → task_id. `workers` 1-8, `worker_instructions`는 단일 문자열(전체에 방송)
+  또는 JSON 배열(워커별 지시).
+- `muse_result(task_id)` → done(마크다운 결과)/running/pending/cancelled
+- `muse_status()` → 워커 풀 heartbeat, 대기/실행 중 작업
+- `muse_cancel(task_id)` → 대기 작업 즉시 취소, 실행 중 작업은 취소 요청
 
-| Path | What |
-|---|---|
-| `plugin/` | Claude Code plugin `muse-bridge` (MCP server + skill + commands) |
-| `cli/setup.js` | `npx muse-bridge setup` — one-command PC preparation |
-| `skills/muse-bridge-setup/` | Muse-side installer skill (payloads: `bw.py`, worker workflow, hook script, SSH proxy) |
+## 브릿지 파일 규약 (home `C:\Users\ghfud\muse-bridge\`)
 
-## Install
+- `queue.json` — MCP 서버만 기록 (submit/cancel)
+- `claims/<id>.json` — 마스터 claim `{id, assignment:0, worker, workers_effective, claimed_at, instructions}`
+- `claims/<id>.a<j>.json` — 슬롯 claim (멀티워커 작업)
+- `results/<id>.md` — 최종 결과 / `results/<id>.part-<j>.md` — 워커별 중간 산출물
+- `status/worker-<n>.json` — 워커 heartbeat `{worker, state, task_id, assignment, updated_at}`
 
-Two sides, in this order:
+## 설치 (home PC)
 
-**1. Muse side first — get the SSH public key.**
-In your Muse chat say: *"install the muse bridge"*. It prints its SSH public
-key. Keep it.
-
-**2. PC side — one command (Administrator terminal recommended).**
 ```powershell
-npx muse-bridge setup --pubkey "ssh-ed25519 AAAA..."
+claude plugin marketplace add C:\Users\ghfud\muse-marketplace
+claude plugin install muse-bridge@muse-marketplace
+claude plugin list   # muse-bridge 확인
 ```
-This creates `%USERPROFILE%\muse-bridge\`, checks Tailscale + OpenSSH Server,
-registers the Muse key, installs the Claude Code plugin, and prints your
-PC's tailnet IP.
 
-**3. Back in Muse chat**, give it the tailnet IP. It finishes SSH pairing
-(first connection needs your approval in the Muse app), installs the worker
-+ watcher hook + fallback crons, and runs an end-to-end test.
+## Muse 측
 
-Then in Claude Code: `/muse-bridge:muse` → describe the task → collect the
-result with `muse_result` (or block with `muse_await`).
-
-## Adding another PC
-
-Run step 2 on the new PC (same pubkey), then in Muse chat say
-*"pair another PC"* with its tailnet IP. Workers are shared; each PC gets its
-own watcher.
-
-## Updating
-
-- PC: `npx -y muse-bridge@latest setup` (idempotent), then
-  `claude plugin update` + restart Claude Code.
-- Muse: re-run the installer skill; it re-copies payloads.
-
-## How it works (short)
-
-The plugin's MCP server (`muse_submit`) appends tasks to
-`%USERPROFILE%\muse-bridge\queue.json`. Every 10s a hook script on the Muse VM
-checks that file over SSH. On new pending tasks it wakes a dispatcher agent,
-which runs `bw.py supervise` (claims, dedup, max-8 concurrency) and launches
-one-shot `muse-bridge-worker` workflows per task. A 15-minute sweep cron is
-the fallback; a 2-hour keeper cron watches the sweep.
-
-## License
-
-MIT
+- saved workflow `muse-bridge-worker` — 상주 워커 풀 (기본 2개, args.pool_size로 조정)
+- 각 워커는 `~/workspace/muse-bridge/worker/bw.py` 로 큐 기계적 처리 + 에이전트 본체가 작업 수행
+- 멀티워커 작업: 마스터 claim → 유휴 워커가 슬롯 claim → 각자 part 작성 → 마스터가 합성
+- keeper cron `muse-bridge-keeper` (6시간 간격) — 워커 사망 시 재실행
