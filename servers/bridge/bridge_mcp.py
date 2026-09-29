@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Muse Bridge MCP server v2.5.0 (bundled in the muse-bridge Claude Code plugin).
+"""Muse Bridge MCP server v2.6.1 (bundled in the muse-bridge Claude Code plugin).
 
 Lets Claude Code delegate tasks to subagents running on the user's Muse VM.
 The bridge home on this machine is %USERPROFILE%\\muse-bridge:
@@ -11,12 +11,15 @@ The bridge home on this machine is %USERPROFILE%\\muse-bridge:
   results/<id>.part-<j>.md   per-worker partial outputs (temporary)
   status/worker-<n>.json     worker heartbeats from the Muse side
   messages/<id>.json         messages from home to the worker(s) on a task
+  activity/<id>.log          per-task worker activity log, pushed from the
+                             Muse side every ~2 min (read by muse_status)
 
 ASCII-only output: the Windows console here is cp949, so every tool result
 is JSON with ensure_ascii=True.
 """
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -65,8 +68,10 @@ _SAVE_RETRY_BASE_SECS = 0.05
 _SAVE_RETRY_FACTOR = 1.5
 _SAVE_RETRY_MAX_SECS = 1.0
 MESSAGES_DIR = os.path.join(BRIDGE_DIR, "messages")
+ACTIVITY_DIR = os.path.join(BRIDGE_DIR, "activity")
 
-for _d in (BRIDGE_DIR, RESULTS_DIR, CLAIMS_DIR, STATUS_DIR, MESSAGES_DIR):
+for _d in (BRIDGE_DIR, RESULTS_DIR, CLAIMS_DIR, STATUS_DIR, MESSAGES_DIR,
+           ACTIVITY_DIR):
     os.makedirs(_d, exist_ok=True)
 
 try:
@@ -101,6 +106,24 @@ def _task_terminal(t):
         return True
     rp = os.path.join(RESULTS_DIR, str(t.get("id")) + ".md")
     return os.path.exists(rp)
+
+
+def _repair_completed_status(q):
+    """Lazy repair for the queue.json completed-update gap: the worker
+    uploads results/<id>.md directly via scp, so the MCP server never sees
+    the completion event and the task sits in "pending" forever (30 such
+    cases observed 2026-09-30), making exporters/sweeps scan dead tasks
+    every cycle. Any task still marked pending that already has a result
+    file is marked completed here. Idempotent; converges after one pass.
+    Returns the number of tasks repaired."""
+    n = 0
+    for t in q.get("tasks", []):
+        if (t.get("status") or "pending") == "pending" and t.get("id") \
+                and os.path.exists(os.path.join(RESULTS_DIR, str(t.get("id")) + ".md")):
+            t["status"] = "completed"
+            t["completed_at"] = int(time.time())
+            n += 1
+    return n
 
 
 def _prune(q, now):
@@ -302,7 +325,8 @@ def muse_submit(prompt: str, label: str = "", workers: int = 1,
         "status": "pending",
         "created_at": int(time.time()),
     }
-    _mutate_queue(lambda q: q["tasks"].append(task))
+    _mutate_queue(lambda q: (q["tasks"].append(task),
+                               _repair_completed_status(q)))
     return _out({"ok": True, "task_id": task_id, "status": "queued",
                  "workers": workers, "priority": priority,
                  "hint": "Call muse_await(task_id) to wait for the result."})
@@ -384,14 +408,59 @@ def muse_await(task_id: str, timeout_secs: int = 600) -> str:
         time.sleep(2)
 
 
+_ACT_LINE_RE = re.compile(r"\[([^\]]+)\]\s+\[w([^\]]+)\]\s+(\S)\s+(.*)")
+
+
+def _read_activity_lines(tid, n):
+    """Last n data lines of the task's worker activity log.
+
+    The log (activity/<task_id>.log) is pushed from the Muse side every
+    ~2 minutes, so entries can be up to ~2 minutes stale. Returns [] when
+    no log exists yet (worker not booted or exporter not run yet).
+    """
+    p = os.path.join(ACTIVITY_DIR, tid + ".log")
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    lines = [ln for ln in lines if ln and not ln.startswith("#")]
+    return lines[-n:] if n > 0 else lines
+
+
+def _activity_snapshot(tid, n=15):
+    """(recent_lines, currently_doing) for a task.
+
+    currently_doing is the latest line when it marks an in-progress step
+    (mark "…"), otherwise "".
+    """
+    lines = _read_activity_lines(tid, n)
+    current = ""
+    if lines:
+        m = _ACT_LINE_RE.match(lines[-1])
+        if m and m.group(3) == "\u2026":
+            current = lines[-1]
+    return lines, current
+
+
 @mcp.tool()
-def muse_status() -> str:
+def muse_status(task_id: str = "") -> str:
     """Show bridge health: worker pool heartbeats, queued/running tasks.
 
     Use this to see whether the Muse side is alive and what it is doing.
+
+    Pass task_id (from muse_submit) to focus on one task: returns its
+    queue/claim state plus the worker's recent activity log
+    (chronological tool actions, per worker) and what the worker is
+    currently doing. Activity entries are pushed from the Muse side about
+    every 2 minutes, so they can lag real time by ~2 minutes.
     """
     now = int(time.time())
     q = _load_queue()
+    if _repair_completed_status(q):
+        # q is already repaired in memory; persist the same repair under
+        # the queue lock so concurrent server processes converge too.
+        _mutate_queue(_repair_completed_status)
     pending = [t for t in q.get("tasks", [])
                if (t.get("status") or "pending") == "pending"
                and not os.path.exists(os.path.join(RESULTS_DIR, str(t.get("id")) + ".md"))
@@ -422,6 +491,10 @@ def muse_status() -> str:
         t = _find_task(q, tid)
         if t:
             detail["label"] = t.get("label", "")
+        recent, current = _activity_snapshot(tid, 3)
+        detail["recent_activity"] = recent
+        if current:
+            detail["currently_doing"] = current
         running.append(detail)
     workers = []
     try:
@@ -441,6 +514,27 @@ def muse_status() -> str:
                         "task_id": w.get("task_id"), "assignment": w.get("assignment"),
                         "heartbeat_age_secs": age, "alive": age < 180})
     alive = [w for w in workers if w["alive"]]
+    if task_id:
+        tid = str(task_id)
+        t = _find_task(q, tid)
+        if t is None and not _claim_files(tid) \
+                and not os.path.exists(os.path.join(RESULTS_DIR, tid + ".md")) \
+                and not _read_activity_lines(tid, 1):
+            return _out({"ok": False, "task_id": tid,
+                         "error": "unknown task_id"})
+        recent, current = _activity_snapshot(tid, 15)
+        detail = {"ok": True, "task_id": tid,
+                  "status": (t.get("status") if t else None) or "unknown",
+                  "label": t.get("label", "") if t else "",
+                  "done": os.path.exists(os.path.join(RESULTS_DIR, tid + ".md")),
+                  "recent_activity": recent}
+        if current:
+            detail["currently_doing"] = current
+        detail["workers_on_task"] = [
+            w for w in workers if w.get("task_id") == tid]
+        detail["note"] = ("Activity is pushed from the Muse side about "
+                          "every 2 minutes; entries can lag real time.")
+        return _out(detail)
     return _out({"ok": True,
                  "bridge_alive": bool(alive),
                  "workers": workers,
@@ -500,6 +594,7 @@ def muse_cancel(task_id: str) -> str:
     outcome = {}
 
     def _do(q):
+        _repair_completed_status(q)
         t = _find_task(q, tid)
         if t is None:
             outcome["error"] = "unknown task_id"
