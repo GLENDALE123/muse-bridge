@@ -64,6 +64,21 @@ function oneShotPrompt(i, tid) {
     "  Before each ws-apply batch, $BW claim-verify <task_id> must print {\"ok\": true} - never apply changes for a task you no longer own. ws-pull/ws-apply refresh your heartbeat automatically (at most every 5 min), but long stretches of local editing still need an explicit $BW heartbeat working <task_id> call every ~2-3 minutes.\n" +
     "  Never overwrite home files with raw scp/del - always go through ws-apply so a backup exists.\n" +
     "\n" +
+    "CHECKPOINT - progress must survive worker replacement. C:\\muse-workspace\\<task_id>\\ is shared across replacement workers for the SAME task:\n" +
+    "  At start (right after claim-new succeeds): $BW ws-get " + tid + " progress.md /tmp/bw-" + i + "/progress.md. If it prints GET_OK, READ THE FILE FIRST - a previous worker was replaced mid-task. Continue from its \"Next steps\" section; do NOT redo completed steps. Mention the resume in your first heartbeat note (e.g. \"이어받음: 3단계부터\").\n" +
+    "  During work: after each major phase (or every ~15 min), update /tmp/bw-" + i + "/progress.md and run $BW ws-put " + tid + " /tmp/bw-" + i + "/progress.md progress.md. A replacement worker is coming for YOUR task if you go silent - leave it a map, not a mystery.\n" +
+    "  Format (keep it short, Korean ok):\n" +
+    "    # Progress: " + tid + "\n" +
+    "    ## Done\n" +
+    "    - (finished steps)\n" +
+    "    ## Applied files\n" +
+    "    - <remote_path> (done, sha <first 8>)\n" +
+    "    ## Test results\n" +
+    "    - (what was run, pass/fail, last 5 lines if failed)\n" +
+    "    ## Next steps\n" +
+    "    - (the very next concrete action)\n" +
+    "  Before upload-result: final ws-put of progress.md with \"## Done\" marked complete.\n" +
+    "\n" +
     "ONESHOT FLOW - do exactly this, then stop:\n" +
     "0. $BW sync. Then announce your boot — the supervisor can ONLY see heartbeats that actually landed on home, and an invisible boot WILL make it launch a duplicate worker for your task. Run: for i in 1 2 3 4 5 6; do R=$($BW heartbeat working " + tid + "); echo \"$R\"; [ \"$R\" = HB_OK ] && break; sleep 15; done\n" +
     "   If no try printed HB_OK, run $BW goodbye and STOP at once: no claim-new, no work, nothing (you are invisible to the supervisor; proceeding would fork a duplicate).\n" +
@@ -77,6 +92,8 @@ function oneShotPrompt(i, tid) {
     "\n" +
     "MASTER FLOW (you own the task):\n" +
     "  OWNERSHIP: $BW claim-verify " + tid + " must print {\"ok\": true} right after claim-new, again before each ws-apply batch / file-change phase, and right before upload-result. If it ever prints {\"ok\": false}, STOP at once: change, create and upload nothing more, upload no result; $BW goodbye; stop. (A lost claim means another worker owns the task now; your writes would corrupt its work.)\n" +
+    "  CHECKPOINT READ: $BW ws-get " + tid + " progress.md /tmp/bw-" + i + "/progress.md - if GET_OK, read it and continue from \"Next steps\" (see CHECKPOINT above).\n" +
+    "  SIZE CHECK (fallback for tasks submitted without source_paths - submit-time budget may have been skipped): if C has no source_size field and C.prompt names source paths on home, run $BW measure-source <path1> [<path2>...] on those paths. If it prints \"over_budget\": true, do NOT do the work: write /tmp/bw-" + i + "/result.md starting with \"# Bridge result: " + tid + "\" containing NEEDS_SPLIT, the measured files/lines, and a proposed split (group by top-level directory, each part under ~2000 lines). $BW upload-result " + tid + " /tmp/bw-" + i + "/result.md, $BW goodbye, stop.\n" +
     "  Cancellation check: $BW task-status " + tid + " - if status is cancelled or cancel_requested is true, write /tmp/bw-" + i + "/result.md starting with \"# Bridge result: " + tid + "\" plus a cancelled note, $BW upload-result " + tid + " /tmp/bw-" + i + "/result.md, $BW goodbye, stop.\n" +
     "  If K==1: do the whole task yourself (C.prompt is the work order). Do the work thoroughly with your tools. Before uploading: $BW claim-verify " + tid + " must print {\"ok\": true} (else abort and upload nothing), then run $BW check-messages " + tid + " once and incorporate anything new. Write the FULL markdown result to /tmp/bw-" + i + "/result.md starting with \"# Bridge result: " + tid + "\". $BW upload-result " + tid + " /tmp/bw-" + i + "/result.md. $BW goodbye. Stop.\n" +
     "  If K>1: S=$($BW slice-brief " + tid + " 0); do slice 0 with S.instruction; write /tmp/bw-" + i + "/part.md; $BW upload-part " + tid + " 0 /tmp/bw-" + i + "/part.md. Then $BW wait-parts " + tid + " <K> <timeout_secs> with timeout_secs = S.timeout_minutes*60. If wait-parts prints WAIT_CANCELLED (exit 4), the task was cancelled: do NOT synthesize or upload anything, $BW cleanup-parts " + tid + ", $BW goodbye, stop. After the wait, read /tmp/bw-" + i + "/inbox-" + tid + ".txt if it exists (messages from home that arrived while waiting) and factor them into your synthesis. After that, $BW sync and download every results/<id>.part-<j>.md via: scp -F /home/hatch/.ssh/config home:muse-bridge/results/<id>.part-<j>.md /tmp/bw-" + i + "/ (best effort per j). Synthesize ONE coherent markdown result: merge, dedupe, keep each worker's contribution labeled, note any missing/slow parts. Write /tmp/bw-" + i + "/result.md starting with \"# Bridge result: " + tid + "\". $BW claim-verify " + tid + " must print {\"ok\": true} before uploading (else abort, upload nothing). $BW upload-result. $BW cleanup-parts " + tid + ". $BW goodbye. Stop.\n" +

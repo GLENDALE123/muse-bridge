@@ -82,6 +82,62 @@ SUPERVISOR_INTENTS = "/tmp/bw-supervisor-intents.json"
 ONESHOT_IDX_MIN = 100
 ONESHOT_IDX_MAX = 199
 MAX_CONCURRENT_WORKERS = 50
+# --- size budget (2026-09-30, home/Muse agreement) ---
+# A single worker task may reference at most this many source lines.
+# Oversized tasks enter a churn spiral (missed heartbeat -> replacement ->
+# progress reset -> slow -> replaced again). muse_submit enforces this on
+# home; measure-source lets the worker double-check tasks that slipped
+# through (submitted without source_paths).
+SIZE_BUDGET_LINES = 2000
+# Runs on home via `python -c` (base64-wrapped to survive cmd.exe quoting).
+# Measures files/lines for the given home-side paths; argv[1] is a base64
+# JSON list of paths. Prints one JSON line.
+_MEASURE_CODE = r'''
+import base64, json, os, sys
+EXTS = {".ts",".tsx",".js",".jsx",".mjs",".cjs",".py",".java",".kt",".go",".rs",".rb",".php",".swift",".cs",".cpp",".c",".h",".hpp",".vue",".svelte",".css",".scss",".less",".html",".xml",".json",".yaml",".yml",".toml",".md",".txt",".sh",".sql"}
+SKIP = {"node_modules",".git","dist","build",".next","out","coverage","__pycache__",".venv","venv","target"}
+def walk(root):
+    files = lines = 0
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in SKIP]
+        for f in fn:
+            if os.path.splitext(f)[1].lower() not in EXTS:
+                continue
+            p = os.path.join(dp, f)
+            try:
+                fh = open(p, "r", encoding="utf-8", errors="replace")
+                n = sum(1 for _ in fh)
+                fh.close()
+            except OSError:
+                continue
+            files += 1
+            lines += n
+    return files, lines
+paths = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))
+per = []
+tf = 0
+tl = 0
+for raw in paths:
+    p = os.path.expanduser(raw)
+    if os.path.isfile(p):
+        try:
+            fh = open(p, "r", encoding="utf-8", errors="replace")
+            n = sum(1 for _ in fh)
+            fh.close()
+        except OSError:
+            n = 0
+        per.append({"path": raw, "files": 1, "lines": n})
+        tf += 1
+        tl += n
+    elif os.path.isdir(p):
+        f, n = walk(p)
+        per.append({"path": raw, "files": f, "lines": n})
+        tf += f
+        tl += n
+    else:
+        per.append({"path": raw, "files": 0, "lines": 0, "missing": True})
+print(json.dumps({"ok": True, "paths": per, "total_files": tf, "total_lines": tl}, ensure_ascii=True))
+'''
 # Bid-election stabilization: how long a bidder waits for rival bids to
 # become visible before deciding the winner. Must comfortably exceed the
 # slowest single scp_put (~a few seconds over the proxy); 3s proved too
@@ -666,7 +722,8 @@ class BW:
                           "prompt": t.get("prompt", ""),
                           "label": t.get("label", ""),
                           "timeout_minutes": int(t.get("timeout_minutes", 60) or 60),
-                          "claimed_at": claim["claimed_at"]}))
+                          "claimed_at": claim["claimed_at"],
+                          "source_size": t.get("source_size")}))
 
     # ---------- claim-verify ----------
     # Fresh ownership check: {"ok": true} iff I still own the task — via the
@@ -1552,6 +1609,41 @@ class BW:
         else:
             print(json.dumps({"status": t.get("status", "pending"),
                               "cancel_requested": bool(t.get("cancel_requested"))}))
+
+    # ---------- measure-source ----------
+    def cmd_measure_source(self, a):
+        """Measure source files/lines on home for the given home-side paths.
+        Usage: measure-source <path1> [<path2> ...]
+        Prints JSON: {ok, paths: [{path, files, lines}], total_files,
+        total_lines, budget_lines, over_budget}. Used by the worker as a
+        fallback size check for tasks submitted without source_paths."""
+        import base64 as _b64
+        paths = [p for p in (a or []) if p]
+        if not paths:
+            print(json.dumps({"ok": False, "error": "no paths given"}))
+            return
+        blob = _b64.b64encode(_MEASURE_CODE.encode("utf-8")).decode("ascii")
+        arg = _b64.b64encode(json.dumps(paths).encode("utf-8")).decode("ascii")
+        outer = ("import base64,sys;"
+                 "exec(base64.b64decode('%s').decode('utf-8'))" % blob)
+        rc, out, err = sh(["python", "-c", '"%s"' % outer, arg], timeout=120)
+        if rc != 0:
+            print(json.dumps({"ok": False, "error": "measure failed on home",
+                              "detail": (err or "")[-200:]}))
+            return
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                data["budget_lines"] = SIZE_BUDGET_LINES
+                data["over_budget"] = (data.get("total_lines", 0)
+                                       > SIZE_BUDGET_LINES)
+                print(json.dumps(data, ensure_ascii=True))
+                return
+        print(json.dumps({"ok": False, "error": "no JSON from home"}))
 
     # ---------- cleanup-parts ----------
     def cmd_cleanup_parts(self, a):
