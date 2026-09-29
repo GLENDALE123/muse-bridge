@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Muse Bridge MCP server v2.6.1 (bundled in the muse-bridge Claude Code plugin).
+"""Muse Bridge MCP server v2.6.2 (bundled in the muse-bridge Claude Code plugin).
 
 Lets Claude Code delegate tasks to subagents running on the user's Muse VM.
 The bridge home on this machine is %USERPROFILE%\\muse-bridge:
@@ -280,7 +280,7 @@ def _load_messages(task_id):
 @mcp.tool()
 def muse_submit(prompt: str, label: str = "", workers: int = 1,
                 worker_instructions: str = "", priority: int = 0,
-                timeout_minutes: int = 60) -> str:
+                timeout_minutes: int = 60, request_session_id: str = "") -> str:
     """Submit a task to Muse subagents on the Muse VM.
 
     prompt: the work order (required).
@@ -292,6 +292,11 @@ def muse_submit(prompt: str, label: str = "", workers: int = 1,
       arrays are cycled across workers.
     priority: higher runs first (default 0).
     timeout_minutes: worker stops after this long (5-480, default 60).
+    request_session_id: idempotency key (optional, unique per logical request,
+      e.g. a uuid). If a task with the same non-empty request_session_id
+      already exists, no new task is created - the existing task is returned
+      with "deduped": true. Pass this when the caller may retry a submit after
+      a timeout, so a retry never creates a duplicate task.
     Returns JSON with task_id. Then call muse_await(task_id) to wait for
     the result (server-side wait, no polling needed).
     """
@@ -312,6 +317,7 @@ def muse_submit(prompt: str, label: str = "", workers: int = 1,
     except (TypeError, ValueError):
         timeout_minutes = 60
     timeout_minutes = max(5, min(480, timeout_minutes))
+    request_session_id = (request_session_id or "").strip()[:64]
 
     task_id = uuid.uuid4().hex[:12]
     task = {
@@ -325,8 +331,26 @@ def muse_submit(prompt: str, label: str = "", workers: int = 1,
         "status": "pending",
         "created_at": int(time.time()),
     }
-    _mutate_queue(lambda q: (q["tasks"].append(task),
-                               _repair_completed_status(q)))
+    if request_session_id:
+        task["request_session_id"] = request_session_id
+
+    cell = {}
+    def _upsert(q):
+        if request_session_id:
+            for t in q.get("tasks", []):
+                if t.get("request_session_id") == request_session_id:
+                    cell["existing"] = t
+                    return
+        q["tasks"].append(task)
+        _repair_completed_status(q)
+    _mutate_queue(_upsert)
+
+    existing = cell.get("existing")
+    if existing is not None:
+        return _out({"ok": True, "task_id": existing["id"],
+                     "status": existing.get("status", "pending"),
+                     "deduped": True,
+                     "hint": "A task with this request_session_id already exists; no new task was created."})
     return _out({"ok": True, "task_id": task_id, "status": "queued",
                  "workers": workers, "priority": priority,
                  "hint": "Call muse_await(task_id) to wait for the result."})
