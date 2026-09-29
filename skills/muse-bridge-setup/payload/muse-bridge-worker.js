@@ -28,6 +28,15 @@ function workerPrompt(i) {
     "  Before each ws-apply batch, $BW claim-verify <task_id> must print {\"ok\": true} - never apply changes for a task you no longer own. ws-pull/ws-apply refresh your heartbeat automatically (at most every 5 min), but long stretches of local editing still need an explicit $BW heartbeat working <task_id> call every ~10 minutes.\n" +
     "  Never overwrite home files with raw scp/del - always go through ws-apply so a backup exists.\n" +
     "\n" +
+    "READING RULES - remote reads are slow (SSH through proxy). Read as little as possible:\n" +
+    "  1. List first: before pulling anything, get the file-name + size list of the target folder (ssh dir / powershell Get-ChildItem). Decide what you need from the list.\n" +
+    "  2. Pull only the files you need - never a whole folder.\n" +
+    "  3. Never merge/concatenate a folder into one big read.\n" +
+    "  4. Follow only the imports the task actually needs - do not chase the full dependency graph.\n" +
+    "  5. Files over 50KB: read in ranges (ws-get supports ranges, or pull then read a slice locally) - never the whole file at once.\n" +
+    "  6. Cache what you pulled in /tmp/bw-" + i + "/ and re-read from there, not from home.\n" +
+    "  7. Tests/builds run on home via ssh in ONE command; bring back at most the last 50 lines of output.\n" +
+    "\n" +
     "SHIFT LOOP - at start compute DEADLINE=$(($(date +%s) + " + SHIFT_SECS + ")). Repeat until $(date +%s) exceeds DEADLINE, then stop quietly:\n" +
     "0. FRESH START (run once at shift start): rm -f /tmp/bw-" + i + "/seen-tasks.json. A restarted worker must see the current queue with fresh eyes; a stale seen-file would make it ignore pending tasks for up to 5 minutes.\n" +
     "1. BLOCKING WAIT (this is the only idle mechanism - never sleep-poll): run PICK=$($BW wait-for-work 2). This blocks inside the helper, checking the queue every 2 seconds with zero LLM cost, and prints one JSON line (action new|join) the moment work appears. It heartbeats as idle and reclaims stale claims on its own while waiting. Parse PICK's JSON action:\n" +
@@ -63,6 +72,15 @@ function oneShotPrompt(i, tid) {
     "  ws-apply always backs up the original (timestamped, per-task) and writes an audit-log entry (who/when/before-sha/after-sha). Inspect with $BW ws-log <task_id>, restore with $BW ws-revert <task_id> <remote_path> (latest backup), list with $BW ws-ls <task_id>, remove staging with $BW ws-clean <task_id> (backups+log are kept).\n" +
     "  Before each ws-apply batch, $BW claim-verify <task_id> must print {\"ok\": true} - never apply changes for a task you no longer own. ws-pull/ws-apply refresh your heartbeat automatically (at most every 5 min), but long stretches of local editing still need an explicit $BW heartbeat working <task_id> call every ~2-3 minutes.\n" +
     "  Never overwrite home files with raw scp/del - always go through ws-apply so a backup exists.\n" +
+    "\n" +
+    "READING RULES - remote reads are slow (SSH through proxy). Read as little as possible:\n" +
+    "  1. List first: before pulling anything, get the file-name + size list of the target folder (ssh dir / powershell Get-ChildItem). Decide what you need from the list.\n" +
+    "  2. Pull only the files you need - never a whole folder.\n" +
+    "  3. Never merge/concatenate a folder into one big read.\n" +
+    "  4. Follow only the imports the task actually needs - do not chase the full dependency graph.\n" +
+    "  5. Files over 50KB: read in ranges (ws-get supports ranges, or pull then read a slice locally) - never the whole file at once.\n" +
+    "  6. Cache what you pulled in /tmp/bw-" + i + "/ and re-read from there, not from home.\n" +
+    "  7. Tests/builds run on home via ssh in ONE command; bring back at most the last 50 lines of output.\n" +
     "\n" +
     "CHECKPOINT - progress must survive worker replacement. C:\\muse-workspace\\<task_id>\\ is shared across replacement workers for the SAME task:\n" +
     "  At start (right after claim-new succeeds): $BW ws-get " + tid + " progress.md /tmp/bw-" + i + "/progress.md. If it prints GET_OK, READ THE FILE FIRST - a previous worker was replaced mid-task. Continue from its \"Next steps\" section; do NOT redo completed steps. Mention the resume in your first heartbeat note (e.g. \"이어받음: 3단계부터\").\n" +

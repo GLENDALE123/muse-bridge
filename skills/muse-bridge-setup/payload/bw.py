@@ -16,13 +16,20 @@ Usage: bw.py --idx N <command> [args...]
 
 Commands:
   sync                          download queue/claims/results listing
-  heartbeat <idle|working> [task_id] [assignment]
+  heartbeat <idle|working> [task_id] [assignment] [--progress-at <epoch>] [--stalled]
   goodbye                     delete my heartbeat (local+home) on terminal exit
   run-hb <task_id> <command...>  run a long command with auto-heartbeat
+  hb-daemon <task_id>         detached 60s heartbeat loop for one claim
+                              (started automatically by claim-new; exits when
+                              the claim/task ends)
+  progress <task_id> [note]   record an explicit progress timestamp
   pick                          print JSON {action: none|new|join, ...}
   claim-new <task_id>           bid election for the master claim
   claim-verify <task_id>        {"ok": true} iff I still own the master claim
   claim-slot <task_id>          take a free slot on a multi-worker task
+  mark-failed <task_id> <reason> drop a failed-task request file for the
+                              MCP server (bw.py never writes queue.json
+                              directly; the server applies it)
   slice-brief <task_id> <slot>  JSON {prompt, instruction, timeout_minutes, ...}
   slot-instructions <task_id> <slot>
   upload-part <task_id> <slot> <localfile>
@@ -143,9 +150,66 @@ print(json.dumps({"ok": True, "paths": per, "total_files": tf, "total_lines": tl
 # slowest single scp_put (~a few seconds over the proxy); 3s proved too
 # short and caused a double master-claim on 2026-09-29.
 ELECTION_SETTLE_SECS = 8
+# Runs on home via `python -c` (base64-wrapped to survive cmd.exe quoting).
+# Locked queue.json status flip for _mark_task_done: executes ON HOME so it
+# can take the SAME inter-process queue.lock the MCP server uses
+# (open a+b, msvcrt.locking LK_LOCK 1 byte at offset 0 — see
+# bridge_mcp.py _QueueFileLock). argv[1] is the task id. Prints one JSON line.
+_MARKDONE_CODE = r'''
+import base64, json, msvcrt, os, sys
+BRIDGE_DIR = "C:\\Users\\ghfud\\muse-bridge"
+tid = sys.argv[1]
+lockp = os.path.join(BRIDGE_DIR, "queue.lock")
+qp = os.path.join(BRIDGE_DIR, "queue.json")
+fd = os.open(lockp, os.O_RDWR | os.O_CREAT)
+changed = False
+try:
+    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+    try:
+        with open(qp, encoding="utf-8") as f:
+            q = json.load(f)
+        for t in q.get("tasks", []):
+            if str(t.get("id")) == tid and (t.get("status") or "pending") == "pending":
+                t["status"] = "done"
+                changed = True
+        if changed:
+            tmp = qp + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(q, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, qp)
+    finally:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    print(json.dumps({"ok": True, "changed": changed}, ensure_ascii=True))
+finally:
+    os.close(fd)
+'''
 # After writing a master/slot claim, re-read it after this delay; if another
 # worker overwrote it in the meantime, concede instead of executing.
 CLAIM_WRITEBACK_CHECK_SECS = 3
+# --- hb-daemon (2026-09-30, claim-scoped deterministic heartbeat) ---
+# Interval between daemon heartbeats. The daemon is a detached process
+# spawned by claim-new; it owns "liveness" so the worker agent can forget
+# the heartbeat discipline without looking dead. Progress (real work) is
+# tracked separately via `progress` / the structural alog.
+HB_DAEMON_INTERVAL_SECS = 60
+# Stalled window: no progress for min(20 min, timeout_minutes/3) counts as
+# stalled. 20 minutes is the absolute ceiling.
+STALLED_MAX_SECS = 1200
+# Structured per-command log (JSON lines), shared across all worker
+# indices on this VM. fcntl-guarded append; best effort, never fails the
+# caller. Used for claim-verify / task-status / ws-get / ws-ls forensics.
+STRUCTLOG_PATH = os.path.expanduser(
+    "~/workspace/muse-bridge/worker/logs/bw-structured.log")
+# Replacement bookkeeping lives under claims/meta/ on home (NOT directly
+# under claims/): files matching claims/*.json are parsed as master/slot
+# claims by claim_names(), so meta files must stay out of that namespace.
+CLAIMS_META_DIR = "claims/meta"
+# A task replaced this many times with no progress is failed, not
+# relaunched (failed_churn).
+MAX_REPLACEMENTS_NO_PROGRESS = 3
 
 
 def sh(args, timeout=60):
@@ -281,11 +345,32 @@ class BW:
 
     # ---------- heartbeat ----------
     def cmd_heartbeat(self, a):
-        state = a[0] if len(a) > 0 else "idle"
-        task_id = a[1] if len(a) > 1 else None
-        assignment = int(a[2]) if len(a) > 2 else None
-        note = a[3] if len(a) > 3 else None
-        if not self._heartbeat(state, task_id, assignment, note):
+        a = list(a or [])
+        # optional trailing flags (parsed from the end so a free-text note
+        # is unaffected): --progress-at <epoch> --stalled
+        progress_at = None
+        stalled = None
+        rest = []
+        i = 0
+        while i < len(a):
+            if a[i] == "--progress-at" and i + 1 < len(a):
+                try:
+                    progress_at = int(a[i + 1])
+                except (ValueError, TypeError):
+                    progress_at = None
+                i += 2
+            elif a[i] == "--stalled":
+                stalled = True
+                i += 1
+            else:
+                rest.append(a[i])
+                i += 1
+        state = rest[0] if len(rest) > 0 else "idle"
+        task_id = rest[1] if len(rest) > 1 else None
+        assignment = int(rest[2]) if len(rest) > 2 else None
+        note = rest[3] if len(rest) > 3 else None
+        if not self._heartbeat(state, task_id, assignment, note,
+                               progress_at=progress_at, stalled=stalled):
             print("HB_FAIL")
             return
         # pure report, no side effects: tell the caller whether home has
@@ -304,6 +389,7 @@ class BW:
         'heartbeat idle'. The idle heartbeat is for pauses; goodbye is for
         exits. Prints GOODBYE_OK, or GOODBYE_LOCAL_OK if the remote delete
         failed (local file still removed)."""
+        self._stop_all_hb_daemons()
         for p in (os.path.join(self.dir, "hb.json"), self._note_path()):
             try:
                 os.unlink(p)
@@ -613,6 +699,80 @@ class BW:
                     pass
             time.sleep(interval)
 
+    # ---------- replacements + first_claimed_at ----------
+    # The timeout clock must survive worker replacement: claim-new records
+    # first_claimed_at (inherited, never overwritten) and every replacement
+    # is journaled in claims/meta/<tid>.replacements.json on home. The meta/
+    # subdir keeps these files out of the claims/*.json namespace, which
+    # claim_names() parses as master/slot claims.
+    def _replacements_remote(self, tid):
+        return BRIDGE + "/" + CLAIMS_META_DIR + "/%s.replacements.json" % tid
+
+    def _ensure_claims_meta(self):
+        sh(["cmd", "/c", "if", "not", "exist",
+            "C:\\Users\\ghfud\\muse-bridge\\claims\\meta", "mkdir",
+            "C:\\Users\\ghfud\\muse-bridge\\claims\\meta"], timeout=30)
+
+    def _read_replacements(self, tid, fresh=False):
+        """Read the replacements record. fresh=True re-downloads from home
+        (claim-new needs it: the local cache may predate the supervise pass
+        that wrote it); otherwise the pass-local synced copy is used."""
+        if fresh:
+            lp = os.path.join(self.dir, "repl-%s.json" % tid)
+            if not scp_get(self._replacements_remote(tid), lp):
+                return None
+        else:
+            lp = os.path.join(self.dir, "claims", "meta",
+                              "%s.replacements.json" % tid)
+        try:
+            with open(lp, encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _write_replacements(self, tid, rep):
+        lp = os.path.join(self.dir, "repl-%s.json" % tid)
+        try:
+            with open(lp, "w", encoding="utf-8") as f:
+                json.dump(rep, f, ensure_ascii=True)
+        except OSError:
+            return False
+        self._ensure_claims_meta()
+        return scp_put(lp, self._replacements_remote(tid))
+
+    def _resolve_first_claimed_at(self, tid, task):
+        """first_claimed_at for a new claim, by priority:
+        1) the replacements record (a previous worker was here),
+        2) a still-present old claim (reclaim hasn't run),
+        3) the queue task's created_at,
+        4) now."""
+        rep = self._read_replacements(tid, fresh=True)
+        if rep:
+            try:
+                v = int(rep.get("first_claimed_at") or 0)
+                if v > 0:
+                    return v, True
+            except (ValueError, TypeError):
+                pass
+        mc = self._read_master_claim(tid)
+        if mc:
+            try:
+                v = int(mc.get("first_claimed_at")
+                        or mc.get("claimed_at") or 0)
+                if v > 0:
+                    return v, True
+            except (ValueError, TypeError):
+                pass
+        if task:
+            try:
+                v = int(task.get("created_at") or task.get("created") or 0)
+                if v > 0:
+                    return v, False
+            except (ValueError, TypeError):
+                pass
+        return now(), False
+
     # ---------- claim-new ----------
     # Distributed election via bid files: upload a uniquely-named bid, wait
     # for rival bids to settle, then the earliest (claimed_at, worker) bid
@@ -691,14 +851,18 @@ class BW:
             ssh_del(BRIDGE + "/claims/" + bidname)
             print(json.dumps({"ok": False, "reason": "already claimed"}))
             return
-        # I won: write the master claim, clean up all bid files
+        # I won: write the master claim, clean up all bid files.
+        # first_claimed_at is inherited (never reset): the timeout clock
+        # survives replacement. See _resolve_first_claimed_at.
         k = max(1, min(MAX_EFFECTIVE_WORKERS, int(t.get("workers", 1) or 1)))
         instr = t.get("worker_instructions") or []
         if not isinstance(instr, list):
             instr = [str(instr)]
+        first_claimed_at, inherited = self._resolve_first_claimed_at(tid, t)
         claim = {"id": tid, "assignment": 0, "worker": self.idx,
                  "workers_requested": int(t.get("workers", 1) or 1),
                  "workers_effective": k, "claimed_at": now(),
+                 "first_claimed_at": first_claimed_at,
                  "instructions": instr,
                  "prompt": t.get("prompt", ""),
                  "label": t.get("label", ""),
@@ -718,11 +882,21 @@ class BW:
         if mc is None or int(mc.get("worker", -1)) != self.idx:
             print(json.dumps({"ok": False, "reason": "overwritten"}))
             return
+        # claim won: start the detached liveness daemon, and seed the
+        # replacements record (count 0) so supervise can journal later
+        # replacements and inherit first_claimed_at across them.
+        if not inherited:
+            self._write_replacements(
+                tid, {"task_id": tid,
+                      "first_claimed_at": first_claimed_at,
+                      "count": 0, "history": []})
+        self._start_hb_daemon(tid)
         print(json.dumps({"ok": True, "effective_k": k,
                           "prompt": t.get("prompt", ""),
                           "label": t.get("label", ""),
                           "timeout_minutes": int(t.get("timeout_minutes", 60) or 60),
                           "claimed_at": claim["claimed_at"],
+                          "first_claimed_at": first_claimed_at,
                           "source_size": t.get("source_size")}))
 
     # ---------- claim-verify ----------
@@ -737,8 +911,10 @@ class BW:
         tid = a[0]
         role = self._owns_task(tid)
         if role is None:
+            self._slog("claim-verify", tid, {"ok": False, "reason": "not owner"})
             print(json.dumps({"ok": False, "reason": "not owner"}))
             return
+        self._slog("claim-verify", tid, {"ok": True, "role": role})
         print(json.dumps({"ok": True, "role": role}))
 
     # ---------- claim-slot ----------
@@ -871,40 +1047,53 @@ class BW:
             # mark the task done in queue.json so the queue view stays
             # accurate (previously the status stayed "pending" forever)
             self._mark_task_done(tid)
+            # the claim's life is over: stop the liveness daemon now
+            # instead of waiting for its next 60s tick to notice
+            self._stop_hb_daemon(tid)
         self._ship_alog(tid)
         print("UPLOAD_OK" if ok else "UPLOAD_FAIL")
 
     def _mark_task_done(self, tid):
         """Flip a task's queue.json status to "done" after its result is
-        published. Best-effort: download fresh queue, flip, atomic replace
-        via temp+move. A concurrent MCP submit/cancel could theoretically
-        interleave, but those are rare and brief; a stale status is
-        self-healing (supervise excludes tasks with result files)."""
-        tmp = os.path.join(self.dir, "queue-markdone.json")
-        if not scp_get(BRIDGE + "/queue.json", tmp):
-            return False
-        try:
-            with open(tmp, encoding="utf-8") as f:
-                q = json.load(f)
-            changed = False
-            for t in q.get("tasks", []):
-                if (str(t.get("id")) == str(tid)
-                        and (t.get("status") or "pending") == "pending"):
-                    t["status"] = "done"
-                    changed = True
-            if not changed:
-                return True
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(q, f, ensure_ascii=False, indent=1)
-        except (OSError, ValueError):
-            return False
-        if not scp_put(tmp, BRIDGE + "/queue.json.new"):
-            return False
-        rc, _, _ = sh(["cmd", "/c", "move", "/y",
-                       "C:\\Users\\ghfud\\muse-bridge\\queue.json.new",
-                       "C:\\Users\\ghfud\\muse-bridge\\queue.json"],
-                      timeout=30)
-        return rc == 0
+        published.
+
+        OWNERSHIP: queue.json is owned by the home MCP server
+        (bridge_mcp.py). bw.py must NOT write it directly as a rule — new
+        code paths must use request files (e.g. mark-failed) and let the
+        server apply them. This method is the one legacy exception
+        (upload-result -> done flip), kept because the queue view would
+        otherwise stay "pending" forever despite the result file existing.
+
+        Because it still touches queue.json, it goes through the SAME
+        inter-process queue.lock protocol the MCP server uses: the
+        read-modify-write executes ON HOME (python -c via SSH) holding
+        queue.lock with msvcrt.locking(LK_LOCK, 1 byte at offset 0) —
+        see bridge_mcp.py _QueueFileLock. A concurrent muse_submit /
+        muse_cancel can no longer interleave a lost update (the old
+        scp_get -> local edit -> scp_put race). There is deliberately NO
+        unlocked fallback: if the home-side script fails we return False
+        and leave the task pending — an unlocked direct write would
+        violate the queue.lock protocol (2026-09-30 requirement). The
+        supervise pass already excludes tasks with results from launch
+        plans, so the worst case is a stale "pending" label, never a
+        corrupted queue.
+        """
+        import base64 as _b64
+        blob = _b64.b64encode(_MARKDONE_CODE.encode("utf-8")).decode("ascii")
+        outer = ("import base64,sys;"
+                 "exec(base64.b64decode('%s').decode('utf-8'))" % blob)
+        rc, out, _ = sh(["python", "-c", '"%s"' % outer, tid], timeout=60)
+        if rc == 0:
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if d.get("ok"):
+                        return True
+        return False
 
     def _note_path(self):
         return os.path.join(self.dir, "hb-note.txt")
@@ -939,7 +1128,27 @@ class BW:
             return
         scp_put(lp, BRIDGE + "/activity/%s.bw-%d.log" % (tid, self.idx))
 
-    def _heartbeat(self, state, task_id=None, assignment=None, note=None):
+    def _slog(self, cmd, tid, result):
+        """Structured one-line JSON log for forensics. Shared file across
+        all worker indices on this VM; fcntl-guarded append so concurrent
+        workers never interleave lines. Best effort — never fails the
+        caller. Fields: ts, time (local), cmd, task_id, worker, result."""
+        try:
+            os.makedirs(os.path.dirname(STRUCTLOG_PATH), exist_ok=True)
+            line = json.dumps({"ts": now(),
+                               "time": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                     time.localtime()),
+                               "cmd": cmd, "task_id": tid, "worker": self.idx,
+                               "result": result}, ensure_ascii=True)
+            with open(STRUCTLOG_PATH, "a", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.write(line + "\n")
+                f.flush()
+        except OSError:
+            pass
+
+    def _heartbeat(self, state, task_id=None, assignment=None, note=None,
+                   progress_at=None, stalled=None):
         # Note persistence: an explicit note is saved; a later call without
         # a note re-attaches the last one (so _maybe_heartbeat never wipes
         # it); going idle clears it.
@@ -961,8 +1170,12 @@ class BW:
                     note = f.read()[:200] or None
             except (OSError, ValueError):
                 pass
+        # last_progress_at / stalled separate "alive" from "making progress".
+        # The hb-daemon fills them from the progress record; ordinary calls
+        # leave them None (unknown), which consumers must not read as False.
         hb = {"worker": self.idx, "state": state, "task_id": task_id,
-              "assignment": assignment, "note": note, "updated_at": now()}
+              "assignment": assignment, "note": note, "updated_at": now(),
+              "last_progress_at": progress_at, "stalled": stalled}
         lp = os.path.join(self.dir, "hb.json")
         try:
             tmp = lp + ".tmp"
@@ -997,6 +1210,283 @@ class BW:
             self._heartbeat("working", task_id, assignment)
         except Exception:
             pass
+
+    # ---------- progress + hb-daemon ----------
+    # Liveness ("the worker process is alive") and progress ("real work is
+    # happening") are separate signals. The hb-daemon owns liveness: a
+    # detached 60s loop calling the same _heartbeat path as everything else,
+    # so the format never diverges. Progress is recorded explicitly by the
+    # worker via `progress <tid>` at real milestones; where the worker
+    # forgets, the structural alog's write time is the fallback. Stalled =
+    # no progress for min(20 min, timeout_minutes/3).
+    def _progress_path(self, tid):
+        return os.path.join(self.dir, "progress-%s.txt" % tid)
+
+    def cmd_progress(self, a):
+        """progress <task_id> [note] — record an explicit progress
+        timestamp for the task. The hb-daemon reads this to fill the
+        heartbeat's last_progress_at; supervise reads the home-side copy
+        for stalled/churn decisions. Prints PROGRESS_OK."""
+        if not a:
+            print("usage: progress <task_id> [note]", file=sys.stderr)
+            return 2
+        tid = a[0]
+        note = " ".join(a[1:])[:120] if len(a) > 1 else ""
+        epoch = now()
+        try:
+            with open(self._progress_path(tid), "w", encoding="utf-8") as f:
+                f.write(str(epoch))
+        except OSError:
+            print("PROGRESS_FAIL")
+            return
+        self._alog(tid, "progress" + (" " + note if note else ""))
+        # ship a task-level marker home (best effort) so the supervisor —
+        # which cannot see this worker's /tmp — can judge progress/churn
+        lp = os.path.join(self.dir, "progress-ship.json")
+        try:
+            with open(lp, "w", encoding="utf-8") as f:
+                json.dump({"task_id": tid, "at": epoch, "worker": self.idx,
+                           "note": note}, f, ensure_ascii=True)
+            scp_put(lp, BRIDGE + "/activity/%s.progress.json" % tid)
+        except OSError:
+            pass
+        print("PROGRESS_OK")
+
+    def _last_progress_at(self, tid):
+        """Local progress epoch: explicit `progress` record first, then the
+        structural alog's mtime as fallback. None if neither exists."""
+        try:
+            with open(self._progress_path(tid), encoding="utf-8") as f:
+                v = int(f.read().strip())
+            if v > 0:
+                return v
+        except (OSError, ValueError):
+            pass
+        try:
+            return int(os.path.getmtime(self._alog_path(tid)))
+        except OSError:
+            return None
+
+    def _progress_at_remote(self, tid):
+        """Task-level last-progress epoch from home-side signals (for the
+        supervisor): 1) activity/<tid>.progress.json (explicit progress
+        calls), 2) newest mtime of activity/<tid>.bw-*.log (shipped alog).
+        None if nothing is found."""
+        rc, out, _ = sh(["cmd", "/c", "type",
+                         "C:\\Users\\ghfud\\muse-bridge\\activity\\%s.progress.json" % tid],
+                        timeout=30)
+        if rc == 0:
+            try:
+                v = int(json.loads(out).get("at", 0) or 0)
+                if v > 0:
+                    return v
+            except (ValueError, TypeError):
+                pass
+        rc, out, _ = sh(["powershell", "-NoProfile", "-Command",
+                         "(Get-ChildItem 'C:\\Users\\ghfud\\muse-bridge\\activity\\%s.bw-*.log' "
+                         "-ErrorAction SilentlyContinue | ForEach-Object { "
+                         "([datetimeoffset]$_.LastWriteTimeUtc).ToUnixTimeSeconds() } | "
+                         "Measure-Object -Maximum).Maximum" % tid],
+                        timeout=30)
+        if rc == 0 and out.strip():
+            try:
+                v = int(out.strip().split()[-1])
+                return v if v > 0 else None
+            except (ValueError, IndexError):
+                pass
+        return None
+
+    def _claim_timeout_info(self, claim, task=None):
+        """(first_claimed_at, timeout_minutes) for a claim dict. The timeout
+        clock is anchored at first_claimed_at — inherited across
+        replacements — so repeated replacement can never reset it (the
+        2026-09-30 Layer-task bug: claimed_at was rewritten on every
+        claim-new). Falls back to the queue task's created_at."""
+        first = 0
+        try:
+            first = int(claim.get("first_claimed_at")
+                        or claim.get("claimed_at") or 0)
+        except (ValueError, TypeError):
+            first = 0
+        if not first and task:
+            try:
+                first = int(task.get("created_at") or task.get("created") or 0)
+            except (ValueError, TypeError):
+                first = 0
+        try:
+            tm = int((claim.get("timeout_minutes")
+                      or (task or {}).get("timeout_minutes") or 60))
+        except (ValueError, TypeError):
+            tm = 60
+        return first, max(1, tm)
+
+    def _stalled_window_secs(self, timeout_minutes):
+        """Stalled iff no progress for min(20 min, timeout_minutes/3)."""
+        return min(STALLED_MAX_SECS, max(1, timeout_minutes) * 60 // 3)
+
+    def _is_stalled(self, tid, progress_at, first_claimed_at,
+                    timeout_minutes):
+        """True when (now - last progress) exceeds the stalled window. A
+        task with no progress record at all counts from first_claimed_at —
+        a claim that never produced anything for a full window is stalled,
+        not merely young."""
+        ref = progress_at or first_claimed_at or None
+        if not ref:
+            return False
+        return now() - ref > self._stalled_window_secs(timeout_minutes)
+
+    def _task_timed_out(self, tid):
+        """Fresh check: has first_claimed_at + timeout_minutes*60 passed?"""
+        mc = self._read_master_claim(tid)
+        if not mc:
+            return False
+        first, tm = self._claim_timeout_info(mc)
+        return bool(first) and now() > first + tm * 60
+
+    # ----- hb-daemon lifecycle -----
+    def _hb_daemon_pidfile(self, tid):
+        return "/tmp/bw-hbdaemon-%d-%s.pid" % (self.idx, tid)
+
+    def _start_hb_daemon(self, tid):
+        """Spawn the detached 60s heartbeat daemon for this claim. Called
+        on claim-new success. Idempotent: any previous daemon for this
+        idx+task is stopped first (never two)."""
+        self._stop_hb_daemon(tid)
+        try:
+            p = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__),
+                 "--idx", str(self.idx), "hb-daemon", tid],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return False
+        try:
+            with open(self._hb_daemon_pidfile(tid), "w") as f:
+                f.write(str(p.pid))
+        except OSError:
+            pass
+        self._alog(tid, "hb-daemon started pid=%d" % p.pid)
+        return True
+
+    def _stop_hb_daemon(self, tid):
+        pf = self._hb_daemon_pidfile(tid)
+        try:
+            with open(pf, encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            try:
+                os.kill(pid, 15)  # SIGTERM; the daemon has no cleanup
+            except OSError:
+                pass  # already gone
+        except (OSError, ValueError):
+            pass
+        try:
+            os.unlink(pf)
+        except OSError:
+            pass
+
+    def _stop_all_hb_daemons(self):
+        import glob as _glob
+        for pf in _glob.glob("/tmp/bw-hbdaemon-%d-*.pid" % self.idx):
+            try:
+                with open(pf, encoding="utf-8") as f:
+                    pid = int(f.read().strip())
+                try:
+                    os.kill(pid, 15)
+                except OSError:
+                    pass
+            except (OSError, ValueError):
+                pass
+            try:
+                os.unlink(pf)
+            except OSError:
+                pass
+
+    def _daemon_should_live(self, tid, claim, tnow, probe_queue):
+        """False when the daemon must exit: claim lost/overwritten, task
+        done (result file), cancelled, or timeout reached."""
+        if claim is None or int(claim.get("worker", -1)) != self.idx:
+            return False  # claim lost or stolen: stop heartbeating
+        if probe_queue:
+            # result-file check rides the same SSH call as the claim read
+            # (see cmd_hb_daemon); queue is probed less often (cancel).
+            if self._task_cancelled(tid):
+                return False
+        first, tm = self._claim_timeout_info(claim)
+        if first and tnow > first + tm * 60:
+            return False  # timeout: heartbeats would only mask a dead task
+        return True
+
+    def cmd_hb_daemon(self, a):
+        """hb-daemon <task_id> — detached liveness loop. NOT for interactive
+        use: claim-new spawns this (start_new_session, stdio to DEVNULL).
+        Every HB_DAEMON_INTERVAL_SECS it sends the standard working
+        heartbeat with last_progress_at/stalled filled in, then exits when
+        the claim is no longer valid (lost, done, cancelled, timeout)."""
+        if not a:
+            print("usage: hb-daemon <task_id>", file=sys.stderr)
+            return 2
+        tid = a[0]
+        pf = self._hb_daemon_pidfile(tid)
+        try:
+            with open(pf, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
+        n = 0
+        fails = 0
+        try:
+            while True:
+                n += 1
+                tnow = now()
+                # one SSH: claim content + result-file marker
+                rc, out, _ = sh(["cmd", "/c",
+                                 "type \"C:\\Users\\ghfud\\muse-bridge\\claims\\%s.json\""
+                                 " & echo ===BW_R=== & dir /b "
+                                 "\"C:\\Users\\ghfud\\muse-bridge\\results\\%s.md\""
+                                 % (tid, tid)], timeout=45)
+                claim = None
+                done = False
+                # the echo always runs (&-chained): a missing marker means
+                # the transport itself broke, not that the claim is gone
+                if "===BW_R===" in out:
+                    fails = 0
+                    head, _, tail = out.partition("===BW_R===")
+                    head, tail = head.strip(), tail.strip()
+                    try:
+                        c = json.loads(head)
+                        claim = c if isinstance(c, dict) else None
+                    except ValueError:
+                        claim = None
+                    done = any(ln.strip().endswith(".md") for ln in
+                               tail.splitlines() if ln.strip()
+                               and "File Not Found" not in ln)
+                else:
+                    fails += 1
+                    if fails >= 3:
+                        break  # home unreachable: stop masking the worker
+                    time.sleep(HB_DAEMON_INTERVAL_SECS)
+                    continue
+                if done:
+                    break
+                # cancel is queue-side; probe it every 3rd tick (3 min)
+                if not self._daemon_should_live(tid, claim, tnow,
+                                                probe_queue=(n % 3 == 0)):
+                    break
+                first, tm = self._claim_timeout_info(claim or {})
+                pa = self._last_progress_at(tid)
+                stalled = self._is_stalled(tid, pa, first, tm)
+                try:
+                    self._heartbeat("working", tid, progress_at=pa,
+                                    stalled=stalled)
+                except Exception:
+                    pass
+                time.sleep(HB_DAEMON_INTERVAL_SECS)
+        finally:
+            try:
+                os.unlink(pf)
+            except OSError:
+                pass
 
     # ---------- check-messages ----------
     def _load_messages(self, tid):
@@ -1462,6 +1952,206 @@ class BW:
                     n += 1
         return n
 
+    # ---------- replacement journaling + churn gate ----------
+    # Every worker replacement is journaled: claims/meta/<tid>.replacements.json
+    # on home (count + history with reason), plus one human-readable line in
+    # home's activity/<tid>.supervise.log. A task replaced
+    # MAX_REPLACEMENTS_NO_PROGRESS times with no progress is failed, not
+    # relaunched (failed_churn) — the 2026-09-30 Layer task was replaced 7
+    # times with the timeout clock resetting on every claim-new.
+    def _mark_failed_remote(self, tid):
+        return BRIDGE + "/" + CLAIMS_META_DIR + "/%s.mark_failed.json" % tid
+
+    def _failed_marker(self, tid):
+        """True if the task is already failed/being failed: a mark_failed
+        request file exists, or the replacements record has failed set.
+        Uses the pass-local synced claims/meta/ copy (synced at pass start)."""
+        lp = os.path.join(self.dir, "claims", "meta",
+                          tid + ".mark_failed.json")
+        if os.path.exists(lp):
+            return True
+        rep = self._read_replacements(tid)
+        return bool(rep and rep.get("failed"))
+
+    def cmd_mark_failed(self, a):
+        """mark-failed <task_id> <reason> — request the MCP server to flip
+        the task to failed.
+
+        CONTRACT (for the MCP-server implementer): bw.py never writes
+        queue.json directly — it is MCP-owned. This drops
+        claims/meta/<tid>.mark_failed.json on home:
+          {"task_id", "reason" ("churn"|"timeout"), "at", "by",
+           "worker_idx", "note"}
+        The server applies it on its next queue-touching call: set the
+        task's status="failed", reason=<reason>, finished_at=now, then
+        consume the request (delete it or rename to .applied). muse_result /
+        muse_await then surface status=failed + reason to the caller.
+        The file lives under claims/meta/ (not claims/) so it never
+        collides with the claims/*.json master/slot-claim namespace."""
+        if not a:
+            print("usage: mark-failed <task_id> <reason>", file=sys.stderr)
+            return 2
+        tid = a[0]
+        reason = a[1] if len(a) > 1 else "churn"
+        req = {"task_id": tid, "reason": reason, "at": now(),
+               "by": "bw-supervise", "worker_idx": self.idx,
+               "note": ("MCP server: set status=failed, reason=%s, "
+                        "finished_at=now, then consume this file" % reason)}
+        lp = os.path.join(self.dir, "markfailed.json")
+        try:
+            with open(lp, "w", encoding="utf-8") as f:
+                json.dump(req, f, ensure_ascii=True)
+        except OSError:
+            print("MARK_FAILED_FAIL")
+            return
+        self._ensure_claims_meta()
+        print("MARK_FAILED_OK"
+              if scp_put(lp, self._mark_failed_remote(tid))
+              else "MARK_FAILED_FAIL")
+
+    def _append_supervise_log(self, tid, line):
+        """Append one line to home's activity/<tid>.supervise.log via
+        download-append-upload. The supervise pass holds the intent flock,
+        so no other supervise writer interleaves; home's MCP server never
+        touches this file."""
+        remote = BRIDGE + "/activity/%s.supervise.log" % tid
+        lp = os.path.join(self.dir, "svlog-%s.txt" % tid)
+        try:
+            if not scp_get(remote, lp):
+                with open(lp, "w", encoding="utf-8") as f:
+                    f.write("")
+            with open(lp, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            return False
+        return scp_put(lp, remote)
+
+    def _replacement_reason(self, tid, prev_worker, rep, task):
+        """Classify why the previous worker is being replaced. Returns
+        (reason, last_hb_at, last_progress_at). Codes: hb_silent (heartbeat
+        gone/stale), stalled (no progress within the window), timeout
+        (first_claimed_at + timeout_minutes passed), claim_lost (worker
+        alive but its claim is gone), ssh_fail (our transport to home
+        broke — not the worker's fault). duplicate_dispatch is logged
+        separately when live workers exceed the crew size."""
+        tnow = now()
+        prog_at = self._progress_at_remote(tid)
+        try:
+            first = int(rep.get("first_claimed_at") or 0)
+        except (ValueError, TypeError):
+            first = 0
+        tm = int((task or {}).get("timeout_minutes", 60) or 60)
+        if first and tnow > first + tm * 60:
+            return "timeout", None, prog_at
+        hb_at = None
+        if prev_worker is None:
+            return "hb_silent", None, prog_at
+        rc, out, _ = sh(["cmd", "/c", "type",
+                         "C:\\Users\\ghfud\\muse-bridge\\status\\worker-%s.json"
+                         % prev_worker], timeout=30)
+        if rc == 99:
+            # transport broke (timeout/exception), not the worker
+            return "ssh_fail", None, prog_at
+        hb = None
+        if rc == 0:
+            try:
+                hb = json.loads(out)
+            except ValueError:
+                hb = None
+        if isinstance(hb, dict):
+            try:
+                hb_at = int(hb.get("updated_at", 0) or 0) or None
+            except (ValueError, TypeError):
+                hb_at = None
+            if hb.get("stalled"):
+                return "stalled", hb_at, prog_at
+            if not hb_at or tnow - hb_at > LIVE_HB_SECS:
+                return "hb_silent", hb_at, prog_at
+        else:
+            return "hb_silent", None, prog_at
+        # heartbeat alive: stalled by the progress clock?
+        if self._is_stalled(tid, prog_at, first, tm):
+            return "stalled", hb_at, prog_at
+        # alive but the claim is gone (reclaimed from under it)
+        if self._read_master_claim(tid) is None:
+            return "claim_lost", hb_at, prog_at
+        return "hb_silent", hb_at, prog_at
+
+    def _task_has_progress(self, tid, rep):
+        """True if any progress was recorded after first_claimed_at."""
+        try:
+            first = int(rep.get("first_claimed_at") or 0)
+        except (ValueError, TypeError):
+            first = 0
+        pa = self._progress_at_remote(tid)
+        return bool(pa and pa > first)
+
+    def _record_replacement(self, tid, prev_worker, reason, hb_at, prog_at,
+                            new_worker, rep):
+        """Journal one replacement: bump count, append history, write the
+        replacements record home, and append the one-line supervise log."""
+        rep = rep or {"task_id": tid, "count": 0, "history": []}
+        if not rep.get("first_claimed_at"):
+            rep["first_claimed_at"] = now()
+        rep["count"] = int(rep.get("count", 0) or 0) + 1
+        rep["last_reason"] = reason
+        rep.setdefault("history", []).append({
+            "at": now(), "prev_worker": prev_worker, "reason": reason,
+            "last_hb_at": hb_at, "last_progress_at": prog_at,
+            "new_worker": new_worker})
+        self._write_replacements(tid, rep)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        def _hm(v):
+            return time.strftime("%H:%M:%S", time.localtime(v)) if v else "-"
+
+        line = "%s | w%s | %s | hb=%s progress=%s | w%s" % (
+            ts, prev_worker, reason, _hm(hb_at), _hm(prog_at), new_worker)
+        self._append_supervise_log(tid, line)
+        return rep
+
+    def _fail_task_churn(self, tid, reason, rep, task):
+        """Stop relaunching: the task was replaced
+        MAX_REPLACEMENTS_NO_PROGRESS times with no progress. Writes the
+        failed summary result (results/<tid>.md), journals the failure,
+        and drops the mark_failed request for the MCP server to apply."""
+        rep = rep or {"task_id": tid, "count": 0, "history": []}
+        rep["failed"] = reason
+        rep["failed_at"] = now()
+        self._write_replacements(tid, rep)
+        self.cmd_mark_failed([tid, reason])
+        label = (task or {}).get("label", "")
+        lines = ["# task %s — FAILED (%s)" % (tid, reason), "",
+                 ("supervise stopped relaunching: %d replacements with no "
+                  "progress since first claim."
+                  % int(rep.get("count", 0))), "",
+                 "## replacement history", ""]
+        for h in rep.get("history", []):
+            at = time.strftime("%Y-%m-%d %H:%M:%S",
+                               time.localtime(h.get("at", 0)))
+            lines.append("- %s: w%s -> w%s (%s)" % (
+                at, h.get("prev_worker"), h.get("new_worker"),
+                h.get("reason")))
+        lines += ["",
+                  "## remaining artifacts",
+                  "- workspace: C:\\muse-workspace\\%s\\" % tid,
+                  "- activity: muse-bridge/activity/%s.* "
+                  "(bw logs, progress, supervise)" % tid,
+                  "- ws backups: C:\\muse-workspace\\_backups\\%s\\" % tid,
+                  "- audit log: C:\\muse-workspace\\_log\\%s.jsonl" % tid,
+                  "",
+                  "label: %s" % label]
+        lp = os.path.join(self.dir, "failed-%s.md" % tid)
+        try:
+            with open(lp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            scp_put(lp, BRIDGE + "/results/%s.md" % tid)
+        except OSError:
+            pass
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        self._append_supervise_log(
+            tid, "%s | - | failed_%s | - | -" % (ts, reason))
+
     def _supervise_once(self):
         """One pass. Returns the launch plan list, or None if the sync
         failed (caller retries).
@@ -1512,6 +2202,11 @@ class BW:
              and t.get("id")),
             key=lambda t: (-(int(t.get("priority", 0) or 0)),
                            int(t.get("created_at", 0) or 0)))
+        # never relaunch a task the churn gate already failed (its
+        # mark_failed request is still waiting for the MCP server, or the
+        # replacements record carries failed)
+        ordered = [t for t in ordered
+                   if not self._failed_marker(str(t.get("id")))]
         pending_ids = {str(t.get("id")) for t in ordered}
         # drop intents for tasks that are no longer actionable so they
         # neither consume the concurrency cap nor block idx reuse
@@ -1550,20 +2245,75 @@ class BW:
                         if j not in claimed_slots
                         and "%s.part-%d.md" % (tid, j) not in results]
                 short = max(0, len(free) - launching)
+                replacement = False
             elif live:
                 # workers alive but no live master (orphaned slots): only a
                 # master is missing; one launch elects it and adopts them
                 short = max(0, 1 - launching)
+                replacement = True
             else:
                 # fresh task or everyone gone: launch the full crew
                 short = max(0, needed - launching)
+                replacement = True
             short = min(short, MAX_CONCURRENT_WORKERS - current_total())
+            if short <= 0:
+                continue
+            # duplicate-dispatch diagnostic: more live workers than the crew
+            # size means an earlier pass double-launched; journal it (this
+            # is not a replacement, just a note for forensics)
+            if len(live) > needed:
+                self._append_supervise_log(
+                    tid, "%s | %s | duplicate_dispatch | - | -" % (
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        ",".join("w%s" % w for w in sorted(live))))
+            rep = self._read_replacements(tid)
+            # a launch counts as a replacement when the task was claimed
+            # before (replacements record exists) and this pass is filling
+            # a gap rather than staffing a fresh task
+            is_replacement = bool(replacement and rep is not None)
+            prev_worker = None
+            reason = None
+            hb_at = prog_at = None
+            if is_replacement:
+                # churn gate: replaced MAX_REPLACEMENTS_NO_PROGRESS times
+                # with no progress -> fail the task, do not relaunch
+                if (int(rep.get("count", 0) or 0)
+                        >= MAX_REPLACEMENTS_NO_PROGRESS
+                        and not self._task_has_progress(tid, rep)):
+                    try:
+                        first = int(rep.get("first_claimed_at") or 0)
+                    except (ValueError, TypeError):
+                        first = 0
+                    tm = int((t or {}).get("timeout_minutes", 60) or 60)
+                    fail_reason = ("timeout"
+                                   if first and now() > first + tm * 60
+                                   else "churn")
+                    self._fail_task_churn(tid, fail_reason, rep, t)
+                    continue
+                # previous worker: the most recent launched worker that is
+                # no longer live (in the orphaned-master case that is the
+                # dead master, not a live slot worker)
+                hist = rep.get("history") or []
+                for h in reversed(hist):
+                    w = h.get("new_worker")
+                    if w not in live:
+                        prev_worker = w
+                        break
+                if prev_worker is None and hist:
+                    prev_worker = hist[-1].get("new_worker")
+                reason, hb_at, prog_at = self._replacement_reason(
+                    tid, prev_worker, rep, t)
+            new_idxs = []
             for _ in range(short):
                 idx = self._alloc_idx(intents)
                 if idx is None:
                     break
                 intents.append({"tid": tid, "idx": idx, "at": tnow})
                 plan.append({"task_id": tid, "idx": idx})
+                new_idxs.append(idx)
+            if is_replacement and new_idxs:
+                self._record_replacement(tid, prev_worker, reason, hb_at,
+                                         prog_at, new_idxs[0], rep)
         # Lock is held for the whole pass, so a plain atomic write is
         # correct here: no other writer can interleave between the load
         # above and this write (record-intent blocks on the same lock).
@@ -1605,9 +2355,14 @@ class BW:
         scp_get(BRIDGE + "/queue.json", self.qpath())
         t = self.find_task(tid)
         if t is None:
+            self._slog("task-status", tid, {"status": "unknown"})
             print(json.dumps({"status": "unknown"}))
         else:
-            print(json.dumps({"status": t.get("status", "pending"),
+            status = t.get("status", "pending")
+            self._slog("task-status", tid,
+                       {"status": status,
+                        "cancel_requested": bool(t.get("cancel_requested"))})
+            print(json.dumps({"status": status,
                               "cancel_requested": bool(t.get("cancel_requested"))}))
 
     # ---------- measure-source ----------
@@ -1752,9 +2507,12 @@ class BW:
     def cmd_ws_get(self, a):
         tid, name, local = a[0], a[1], a[2]
         if not (self._ws_ok(tid) and self._ws_ok(name)):
+            self._slog("ws-get", tid, {"ok": False, "reason": "bad args"})
             print("GET_FAIL")
             return
-        print("GET_OK" if scp_get("C:/muse-workspace/%s/%s" % (tid, name), local) else "GET_FAIL")
+        ok = scp_get("C:/muse-workspace/%s/%s" % (tid, name), local)
+        self._slog("ws-get", tid, {"ok": ok, "file": name})
+        print("GET_OK" if ok else "GET_FAIL")
 
     def cmd_ws_put(self, a):
         tid, local, name = a[0], a[1], a[2]
@@ -1767,10 +2525,13 @@ class BW:
     def cmd_ws_ls(self, a):
         tid = a[0]
         if not self._ws_ok(tid):
+            self._slog("ws-ls", tid, {"ok": False, "reason": "bad task_id"})
             print(json.dumps([]))
             return
         rc, out, _ = sh(["cmd", "/c", "dir", "/b", self.WSROOT + "\\" + tid], timeout=30)
-        print(json.dumps([ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []))
+        files = [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+        self._slog("ws-ls", tid, {"ok": rc == 0, "files": len(files)})
+        print(json.dumps(files))
 
     def cmd_ws_apply(self, a):
         tid, name, rpath = a[0], a[1], a[2]
