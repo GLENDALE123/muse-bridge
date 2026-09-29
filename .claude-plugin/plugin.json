@@ -14,5 +14,5 @@
   "mcpServers": "./.mcp.json",
   "name": "muse-bridge",
   "skills": "./skills/",
-  "version": "2.6.1"
+  "version": "2.6.2"
 }
