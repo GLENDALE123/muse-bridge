@@ -17,6 +17,8 @@ Usage: bw.py --idx N <command> [args...]
 Commands:
   sync                          download queue/claims/results listing
   heartbeat <idle|working> [task_id] [assignment]
+  goodbye                     delete my heartbeat (local+home) on terminal exit
+  run-hb <task_id> <command...>  run a long command with auto-heartbeat
   pick                          print JSON {action: none|new|join, ...}
   claim-new <task_id>           bid election for the master claim
   claim-verify <task_id>        {"ok": true} iff I still own the master claim
@@ -47,6 +49,7 @@ Exit codes: 0 ok. wait-parts: 0 all parts present, 2 timeout, 3 stalled,
 """
 import json
 import os
+import fcntl
 import shutil
 import subprocess
 import sys
@@ -78,7 +81,7 @@ SUPERVISOR_INTENTS = "/tmp/bw-supervisor-intents.json"
 # supervisor's own idx (99) so heartbeat files never collide.
 ONESHOT_IDX_MIN = 100
 ONESHOT_IDX_MAX = 199
-MAX_CONCURRENT_WORKERS = 8
+MAX_CONCURRENT_WORKERS = 50
 # Bid-election stabilization: how long a bidder waits for rival bids to
 # become visible before deciding the winner. Must comfortably exceed the
 # slowest single scp_put (~a few seconds over the proxy); 3s proved too
@@ -162,6 +165,14 @@ class BW:
     def cmd_sync(self, a=None):
         print("SYNC_OK" if self._sync() else "SYNC_FAIL")
 
+    def _sync_status(self):
+        """Download home's status/ (worker heartbeat files) to the local
+        cache. Best effort; used by the stale-heartbeat reaper. Kept
+        separate from _sync() so high-frequency worker commands don't pay
+        for it — only supervise/reclaim need the full status dir."""
+        shutil.rmtree(os.path.join(self.dir, "status"), ignore_errors=True)
+        scp_get(BRIDGE + "/status", self.dir, recursive=True)
+
     def load_queue(self):
         try:
             with open(self.qpath(), encoding="utf-8") as f:
@@ -217,7 +228,131 @@ class BW:
         state = a[0] if len(a) > 0 else "idle"
         task_id = a[1] if len(a) > 1 else None
         assignment = int(a[2]) if len(a) > 2 else None
-        print("HB_OK" if self._heartbeat(state, task_id, assignment) else "HB_FAIL")
+        note = a[3] if len(a) > 3 else None
+        if not self._heartbeat(state, task_id, assignment, note):
+            print("HB_FAIL")
+            return
+        # pure report, no side effects: tell the caller whether home has
+        # cancelled this task so it can stop on its own terms.
+        if task_id and self._task_cancelled(task_id):
+            print("HB_OK_CANCELLED")
+        else:
+            print("HB_OK")
+
+    def cmd_goodbye(self, a):
+        """goodbye — terminal exit: delete this worker's heartbeat file both
+        locally and on home, so the supervisor sees the worker as gone
+        immediately instead of waiting out the silence window (420s) or the
+        stale reaper (840s/24h). Call once on every terminal exit path
+        (task done, claim lost, cancelled, timeout) instead of
+        'heartbeat idle'. The idle heartbeat is for pauses; goodbye is for
+        exits. Prints GOODBYE_OK, or GOODBYE_LOCAL_OK if the remote delete
+        failed (local file still removed)."""
+        for p in (os.path.join(self.dir, "hb.json"), self._note_path()):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        ok = ssh_del(BRIDGE + "/status/worker-%d.json" % self.idx)
+        print("GOODBYE_OK" if ok else "GOODBYE_LOCAL_OK")
+
+    def cmd_run_hb(self, a):
+        """run-hb <task_id> <command...>  Run a long command with auto-heartbeat.
+
+        Structural fix for false-death: a worker busy in a long phase
+        (tests, builds, big transfers) no longer needs to remember to
+        heartbeat. The heartbeat fires inside this call's wait loop every
+        60s, so even a distracted worker stays visibly alive and its claim
+        is never reclaimed mid-work. Prints the command's combined output
+        (truncated past 20k chars) and exits with the command's code.
+
+        The child's output goes to a temp file, never a PIPE, so large
+        output cannot deadlock the wait loop. Cancel-aware: every 60s tick
+        also checks home's queue.json for a cancel; on cancel the child is
+        SIGTERM'd (SIGKILL after 5s), an idle heartbeat is sent,
+        RUN_HB_CANCELLED is printed, and the exit code is 3.
+        """
+        if len(a) < 2:
+            print("usage: run-hb <task_id> <command...>", file=sys.stderr)
+            return 2
+        tid, cmd = a[0], a[1:]
+        import subprocess
+        import time
+        out_path = os.path.join(self.dir, "runhb-%s.out" % tid)
+        try:
+            out_f = open(out_path, "wb")
+        except OSError as e:
+            print("RUN_HB_SPAWN_FAIL: %s" % e, file=sys.stderr)
+            return 2
+        try:
+            try:
+                p = subprocess.Popen(cmd, stdout=out_f,
+                                     stderr=subprocess.STDOUT)
+            except OSError as e:
+                print("RUN_HB_SPAWN_FAIL: %s" % e, file=sys.stderr)
+                return 2
+            # the child holds its own fd now; close ours so a lingering
+            # writer cannot keep the file (or the read) open
+            out_f.close()
+            out_f = None
+            # code-generated progress note: the running command, so a long
+            # silent phase (tests, builds) is visible without trusting the
+            # worker to narrate itself.
+            run_note = "run: " + " ".join(cmd)[:120]
+            self._alog(tid, run_note)
+            self._heartbeat("working", tid, note=run_note)
+            # 10s ticks so we notice child exit promptly; heartbeat every 60s.
+            ticks = 0
+            while p.poll() is None:
+                time.sleep(10)
+                ticks += 1
+                if p.poll() is None and ticks % 6 == 0:
+                    if self._task_cancelled(tid):
+                        # structural cancel: stop the child instead of
+                        # burning a worker slot on a dead task
+                        try:
+                            p.terminate()
+                        except OSError:
+                            pass
+                        for _ in range(50):
+                            if p.poll() is not None:
+                                break
+                            time.sleep(0.1)
+                        if p.poll() is None:
+                            try:
+                                p.kill()
+                            except OSError:
+                                pass
+                        p.wait()
+                        self._heartbeat("idle", tid)
+                        print("RUN_HB_CANCELLED")
+                        sys.stdout.flush()
+                        return 3
+                    self._heartbeat("working", tid, note=run_note)
+            p.wait()
+            out = ""
+            try:
+                with open(out_path, "rb") as f:
+                    out = f.read().decode("utf-8", errors="replace")
+            except OSError:
+                pass
+            if out:
+                if len(out) > 20000:
+                    out = out[:20000] + "\n...[truncated %d chars]" % (len(out) - 20000)
+                sys.stdout.write(out)
+                sys.stdout.flush()
+            print("RUN_HB_EXIT=%d" % p.returncode)
+            return p.returncode
+        finally:
+            try:
+                if out_f is not None:
+                    out_f.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
 
     # ---------- pick ----------
     def _pick_action(self):
@@ -464,6 +599,7 @@ class BW:
 
     def cmd_claim_new(self, a):
         tid = a[0]
+        self._alog(tid, "claim-new")
         t = self.find_task(tid)
         if t is None:
             print(json.dumps({"ok": False, "reason": "task gone"}))
@@ -554,6 +690,7 @@ class BW:
     # and the written slot claim is read back before reporting ok.
     def cmd_claim_slot(self, a):
         tid = a[0]
+        self._alog(tid, "claim-slot")
         mc = self._read_master_claim(tid)
         if mc is None:
             print(json.dumps({"ok": False, "reason": "no master claim"}))
@@ -647,6 +784,7 @@ class BW:
     # ---------- uploads ----------
     def cmd_upload_part(self, a):
         tid, slot, local = a[0], a[1], a[2]
+        self._alog(tid, "upload-part slot %s" % slot)
         # write fence: the master may only upload part 0, a slot worker only
         # its own slot's part. Holds even when the agent skips claim-verify.
         try:
@@ -660,28 +798,126 @@ class BW:
                               "reason": "upload-part blocked: no claim"}))
             return
         ok = scp_put(local, BRIDGE + "/results/%s.part-%s.md" % (tid, slot))
+        self._ship_alog(tid)
         print("UPLOAD_OK" if ok else "UPLOAD_FAIL")
 
     def cmd_upload_result(self, a):
         tid, local = a[0], a[1]
+        self._alog(tid, "upload-result")
         # write fence: only the live master may publish the final result
         if self._owns_task(tid) != "master":
             print(json.dumps({"ok": False, "error": "not owner",
                               "reason": "upload-result blocked: not master"}))
             return
         ok = scp_put(local, BRIDGE + "/results/%s.md" % tid)
+        if ok:
+            # mark the task done in queue.json so the queue view stays
+            # accurate (previously the status stayed "pending" forever)
+            self._mark_task_done(tid)
+        self._ship_alog(tid)
         print("UPLOAD_OK" if ok else "UPLOAD_FAIL")
 
-    def _heartbeat(self, state, task_id=None, assignment=None):
+    def _mark_task_done(self, tid):
+        """Flip a task's queue.json status to "done" after its result is
+        published. Best-effort: download fresh queue, flip, atomic replace
+        via temp+move. A concurrent MCP submit/cancel could theoretically
+        interleave, but those are rare and brief; a stale status is
+        self-healing (supervise excludes tasks with result files)."""
+        tmp = os.path.join(self.dir, "queue-markdone.json")
+        if not scp_get(BRIDGE + "/queue.json", tmp):
+            return False
+        try:
+            with open(tmp, encoding="utf-8") as f:
+                q = json.load(f)
+            changed = False
+            for t in q.get("tasks", []):
+                if (str(t.get("id")) == str(tid)
+                        and (t.get("status") or "pending") == "pending"):
+                    t["status"] = "done"
+                    changed = True
+            if not changed:
+                return True
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(q, f, ensure_ascii=False, indent=1)
+        except (OSError, ValueError):
+            return False
+        if not scp_put(tmp, BRIDGE + "/queue.json.new"):
+            return False
+        rc, _, _ = sh(["cmd", "/c", "move", "/y",
+                       "C:\\Users\\ghfud\\muse-bridge\\queue.json.new",
+                       "C:\\Users\\ghfud\\muse-bridge\\queue.json"],
+                      timeout=30)
+        return rc == 0
+
+    def _note_path(self):
+        return os.path.join(self.dir, "hb-note.txt")
+
+    # ---------- structural activity log ----------
+    # Free, trustworthy "what is the worker doing": every task-scoped bw.py
+    # call appends a phase line locally; the buffer ships to home's
+    # activity/<tid>.bw-<idx>.log on heartbeat/uploads (overwrite is safe:
+    # the local file is the complete append-only source, one file per
+    # worker so slot workers never clobber each other). This is code-
+    # generated ground truth, not prompt-dependent self-reporting. The
+    # DB-derived <tid>.log keeps the per-tool-call forensic detail.
+    def _alog_path(self, tid):
+        return os.path.join(self.dir, "activity-%s.log" % tid)
+
+    def _alog(self, tid, event):
+        if not tid or not self._ws_ok(tid):
+            return
+        line = "[%s] [w%d] %s\n" % (
+            time.strftime("%H:%M:%S", time.localtime()), self.idx, event)
+        try:
+            with open(self._alog_path(tid), "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass
+
+    def _ship_alog(self, tid):
+        if not tid:
+            return
+        lp = self._alog_path(tid)
+        if not os.path.exists(lp):
+            return
+        scp_put(lp, BRIDGE + "/activity/%s.bw-%d.log" % (tid, self.idx))
+
+    def _heartbeat(self, state, task_id=None, assignment=None, note=None):
+        # Note persistence: an explicit note is saved; a later call without
+        # a note re-attaches the last one (so _maybe_heartbeat never wipes
+        # it); going idle clears it.
+        if state == "idle":
+            note = None
+            try:
+                os.unlink(self._note_path())
+            except OSError:
+                pass
+        elif note is not None:
+            try:
+                with open(self._note_path(), "w", encoding="utf-8") as f:
+                    f.write(note[:200])
+            except OSError:
+                pass
+        else:
+            try:
+                with open(self._note_path(), encoding="utf-8") as f:
+                    note = f.read()[:200] or None
+            except (OSError, ValueError):
+                pass
         hb = {"worker": self.idx, "state": state, "task_id": task_id,
-              "assignment": assignment, "updated_at": now()}
+              "assignment": assignment, "note": note, "updated_at": now()}
         lp = os.path.join(self.dir, "hb.json")
         try:
-            with open(lp, "w", encoding="utf-8") as f:
+            tmp = lp + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(hb, f)
+            os.replace(tmp, lp)
         except OSError:
             return False
-        return scp_put(lp, BRIDGE + "/status/worker-%d.json" % self.idx)
+        ok = scp_put(lp, BRIDGE + "/status/worker-%d.json" % self.idx)
+        if ok:
+            self._ship_alog(task_id)
+        return ok
 
     def _maybe_heartbeat(self, task_id, assignment=None, min_gap=300):
         """Refresh the working heartbeat at most every min_gap seconds.
@@ -769,6 +1005,7 @@ class BW:
     # ---------- wait-parts ----------
     def cmd_wait_parts(self, a):
         tid, k, timeout_s = a[0], int(a[1]), int(a[2])
+        self._alog(tid, "wait-parts K=%d" % k)
         start = now()
         last_progress = start
         seen = set()
@@ -830,6 +1067,62 @@ class BW:
             return False
 
     # ---------- reclaim ----------
+    # How long a heartbeat file may sit before the reaper treats it as a
+    # corpse or litter. Live workers heartbeat every 2-3 min (run-hb every
+    # 60s), so 2*LIVE_HB_SECS without a beat means the worker is dead;
+    # deleting the file is self-healing (the worker's next heartbeat, if
+    # it is somehow still alive, recreates it) and the supervisor already
+    # treats such a worker as dead past LIVE_HB_SECS anyway.
+    CORPSE_HB_SECS = 2 * 420
+    LITTER_HB_SECS = 86400
+
+    def _reap_stale_heartbeats(self, tnow):
+        """Delete corpse/litter worker status files on home, based on the
+        local status cache (call _sync_status() first):
+        - state=working but updated_at older than CORPSE_HB_SECS: the
+          worker died without a final heartbeat (the 7 zombies of
+          2026-09-30 were exactly this).
+        - state=idle older than LITTER_HB_SECS: exited workers' litter.
+        - state not in (working, idle): corrupt write (e.g. the
+          worker-112 file whose state field held a task_id); atomic
+          heartbeat writes prevent new ones, this cleans old ones.
+        A worker actively writing the ws audit log is spared even with a
+        stale heartbeat (same guard as _reclaim: its heartbeat path may
+        be broken while it is alive). Returns the number deleted."""
+        d = os.path.join(self.dir, "status")
+        try:
+            names = [n for n in os.listdir(d) if n.endswith(".json")]
+        except OSError:
+            return 0
+        n = 0
+        for name in names:
+            try:
+                with open(os.path.join(d, name), encoding="utf-8") as f:
+                    hb = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(hb, dict):
+                continue
+            state = hb.get("state")
+            try:
+                age = tnow - int(hb.get("updated_at", 0) or 0)
+            except (ValueError, TypeError):
+                continue
+            if state == "working":
+                if age <= self.CORPSE_HB_SECS:
+                    continue
+                tid = hb.get("task_id")
+                if tid and self._ws_log_active(str(tid), self.CORPSE_HB_SECS):
+                    continue
+            elif state == "idle":
+                if age <= self.LITTER_HB_SECS:
+                    continue
+            elif age <= 3600:
+                continue
+            if ssh_del(BRIDGE + "/status/" + name):
+                n += 1
+        return n
+
     def _claim_abandoned(self, tid, c, hb, tnow):
         """True if the claim's owner is alive but its own heartbeat shows it
         is no longer working on this task (idle, or working on another task).
@@ -950,8 +1243,19 @@ class BW:
         return reclaimed
 
     def cmd_reclaim(self, a=None):
+        # Never decide on the local cache alone: a stale cache makes
+        # reclaim a no-op at best and a live-claim stealer at worst.
+        if not self._sync():
+            print("RECLAIM_SYNC_FAIL")
+            return
         reclaimed = self._reclaim()
-        print("RECLAIMED " + " ".join(reclaimed) if reclaimed else "RECLAIM_NONE")
+        self._sync_status()
+        reaped = self._reap_stale_heartbeats(now())
+        if reclaimed or reaped:
+            print("RECLAIMED " + " ".join(reclaimed) +
+                  (" REAPED_HB=%d" % reaped if reaped else ""))
+        else:
+            print("RECLAIM_NONE")
 
     # ---------- supervise ----------
     # On-demand worker management (v3.0.0). The supervisor agent runs
@@ -962,8 +1266,23 @@ class BW:
     # launches one workflow per entry. Prints [] when nothing needs
     # launching. Launch intents (supervisor-local) cover workers that are
     # still booting and have no heartbeat/claim yet, so they are never
-    # double-launched. With block_secs, waits (5s granularity, zero LLM
-    # cost) until something needs launching or the timeout expires.
+    # double-launched. Each pass holds the single intent flock for its
+    # whole duration (sync -> reclaim -> plan -> intent write), so two
+    # concurrent dispatchers serialize and can never compute overlapping
+    # plans. With block_secs, waits (5s granularity, zero LLM cost) until
+    # something needs launching or the timeout expires.
+    _INTENT_LOCK_PATH = "/tmp/bw-supervisor-intents.lock"
+
+    def _intent_lock(self):
+        """Exclusive flock on the intent lock file. bw.py is the single
+        writer code path for intents; dispatchers record via
+        `record-intent`, never by manual file append (the old manual
+        append raced with supervise's read-modify-write and lost entries).
+        Returns the open file; closing it releases the lock."""
+        f = open(self._INTENT_LOCK_PATH, "w")
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        return f
+
     def _load_intents(self):
         try:
             with open(SUPERVISOR_INTENTS, encoding="utf-8") as f:
@@ -974,12 +1293,43 @@ class BW:
         return [e for e in items if isinstance(e, dict)
                 and tnow - int(e.get("at", 0) or 0) < INTENT_TTL_SECS]
 
-    def _save_intents(self, intents):
+    def _write_intents_locked(self, intents):
+        """Atomic write; caller must hold the intent lock."""
+        tmp = SUPERVISOR_INTENTS + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(intents, f)
+        os.replace(tmp, SUPERVISOR_INTENTS)
+
+    def cmd_record_intent(self, a):
+        """record-intent <task_id> <idx> — dispatcher entry point for launch
+        intents. Locked read-modify-write; replaces the old manual-append
+        instruction in dispatcher prompts."""
+        if len(a) < 2:
+            print("usage: record-intent <task_id> <idx>", file=sys.stderr)
+            return 2
+        tid = a[0]
         try:
-            with open(SUPERVISOR_INTENTS, "w", encoding="utf-8") as f:
-                json.dump(intents, f)
+            idx = int(a[1])
+        except (ValueError, TypeError):
+            print("INTENT_FAIL bad idx", file=sys.stderr)
+            return 2
+        try:
+            lock = self._intent_lock()
         except OSError:
-            pass
+            print("INTENT_FAIL")
+            return
+        try:
+            items = self._load_intents()
+            items = [e for e in items
+                     if not (str(e.get("tid")) == str(tid)
+                             and int(e.get("idx", -1) or -1) == idx)]
+            items.append({"tid": str(tid), "idx": idx, "at": now()})
+            self._write_intents_locked(items)
+            print("INTENT_OK")
+        except (OSError, ValueError):
+            print("INTENT_FAIL")
+        finally:
+            lock.close()
 
     def _alloc_idx(self, intents):
         used = set()
@@ -1057,7 +1407,30 @@ class BW:
 
     def _supervise_once(self):
         """One pass. Returns the launch plan list, or None if the sync
-        failed (caller retries)."""
+        failed (caller retries).
+
+        The whole pass — sync, reclaim, plan computation, intent
+        reservation — runs under the single intent flock, so two
+        concurrent dispatchers (hook + sweep) can never compute
+        overlapping plans: the second one blocks on the lock, then sees
+        the first one's reserved intents and excludes those tasks. The
+        lock is per-pass (released between block-mode iterations); flock
+        auto-releases if the process dies, so no stale-lock cleanup is
+        ever needed."""
+        try:
+            lock = self._intent_lock()
+        except OSError:
+            return None
+        try:
+            return self._supervise_pass_locked()
+        finally:
+            lock.close()
+
+    def _supervise_pass_locked(self):
+        """Body of _supervise_once. Caller must hold the intent lock, so
+        the intent read-compute-write is atomic and no merge is needed —
+        every intent writer (supervise, record-intent) goes through this
+        same lock."""
         if not self._sync():
             return None
         tnow = now()
@@ -1067,6 +1440,10 @@ class BW:
             # shorter windows than the old pool defaults because one-shot
             # workers heartbeat every ~2-3 minutes during work
             self._reclaim(stale_hb_secs=LIVE_HB_SECS, stale_claim_secs=600)
+        # corpse/litter heartbeat files on home (dead workers' "working"
+        # files, exited workers' old "idle" files, corrupt writes)
+        self._sync_status()
+        self._reap_stale_heartbeats(tnow)
         q = self.load_queue()
         results = set(self.result_names())
         intents = self._load_intents()
@@ -1130,7 +1507,10 @@ class BW:
                     break
                 intents.append({"tid": tid, "idx": idx, "at": tnow})
                 plan.append({"task_id": tid, "idx": idx})
-        self._save_intents(intents)
+        # Lock is held for the whole pass, so a plain atomic write is
+        # correct here: no other writer can interleave between the load
+        # above and this write (record-intent blocks on the same lock).
+        self._write_intents_locked(intents)
         return plan
 
     def cmd_supervise(self, a=None):
@@ -1176,17 +1556,20 @@ class BW:
     # ---------- cleanup-parts ----------
     def cmd_cleanup_parts(self, a):
         tid = a[0]
+        self._alog(tid, "cleanup-parts")
         # write fence: only the master deletes a task's part files
         if self._owns_task(tid) != "master":
             print(json.dumps({"ok": False, "error": "not owner",
                               "reason": "cleanup-parts blocked: not master"}))
             return
         ssh_del(BRIDGE + "/results/%s.part-*.md" % tid)
+        self._ship_alog(tid)
         print("CLEANUP_OK")
 
     # ---------- slice-brief ----------
     def cmd_slice_brief(self, a):
         tid, slot = a[0], int(a[1])
+        self._alog(tid, "slice-brief slot %d" % slot)
         lp = os.path.join(self.dir, "master.json")
         if not scp_get(BRIDGE + "/claims/%s.json" % tid, lp):
             print(json.dumps({"ok": False}))
@@ -1248,6 +1631,7 @@ class BW:
 
     def cmd_ws_init(self, a):
         tid = a[0]
+        self._alog(tid, "ws-init")
         if not self._ws_ok(tid):
             print(json.dumps({"ok": False, "error": "bad task_id"}))
             return
@@ -1257,6 +1641,7 @@ class BW:
     def cmd_ws_pull(self, a):
         tid, rpath = a[0], a[1]
         name = a[2] if len(a) > 2 else rpath.replace("/", "\\").rsplit("\\", 1)[-1]
+        self._alog(tid, "ws-pull %s" % name)
         if not self._ws_ok(tid) or not self._ws_ok(name):
             print(json.dumps({"ok": False, "error": "bad args"}))
             return
@@ -1281,6 +1666,7 @@ class BW:
 
     def cmd_ws_put(self, a):
         tid, local, name = a[0], a[1], a[2]
+        self._alog(tid, "ws-put %s" % name)
         if not (self._ws_ok(tid) and self._ws_ok(name)):
             print("PUT_FAIL")
             return
@@ -1296,6 +1682,7 @@ class BW:
 
     def cmd_ws_apply(self, a):
         tid, name, rpath = a[0], a[1], a[2]
+        self._alog(tid, "ws-apply %s" % name)
         if not (self._ws_ok(tid) and self._ws_ok(name)):
             print(json.dumps({"ok": False, "error": "bad args"}))
             return
