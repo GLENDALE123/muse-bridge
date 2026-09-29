@@ -1,0 +1,18 @@
+{
+  "author": {
+    "name": "tnplab"
+  },
+  "commands": "./commands/",
+  "description": "Delegate tasks to Muse subagents running on your Muse VM: submit work with worker count and per-worker instructions, poll results, check bridge status, cancel tasks.",
+  "keywords": [
+    "muse",
+    "subagent",
+    "delegation",
+    "bridge"
+  ],
+  "license": "MIT",
+  "mcpServers": "./.mcp.json",
+  "name": "muse-bridge",
+  "skills": "./skills/",
+  "version": "2.4.1"
+}
