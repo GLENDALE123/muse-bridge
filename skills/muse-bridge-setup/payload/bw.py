@@ -62,6 +62,24 @@ import subprocess
 import sys
 import time
 
+# All human-readable log timestamps are KST (Asia/Seoul, UTC+9): the VM
+# runs on UTC but the bridge is operated in the user's timezone. Epoch
+# values (claimed_at, updated_at, etc.) stay timezone-agnostic.
+KST_OFFSET = 9 * 3600
+
+
+def _kst_now():
+    return time.time() + KST_OFFSET
+
+
+def _kst_str(fmt="%Y-%m-%d %H:%M:%S", ts=None):
+    return time.strftime(fmt, time.gmtime((ts if ts is not None
+                                          else time.time()) + KST_OFFSET))
+
+
+def _kst_hm(ts):
+    return _kst_str("%H:%M:%S", ts) if ts else "-"
+
 SSH_CONFIG = "/home/hatch/.ssh/config"
 REMOTE = "home"
 BRIDGE = "muse-bridge"  # relative to home dir on the home PC
@@ -1113,7 +1131,7 @@ class BW:
         if not tid or not self._ws_ok(tid):
             return
         line = "[%s] [w%d] %s\n" % (
-            time.strftime("%H:%M:%S", time.localtime()), self.idx, event)
+            _kst_str("%H:%M:%S"), self.idx, event)
         try:
             with open(self._alog_path(tid), "a", encoding="utf-8") as f:
                 f.write(line)
@@ -1136,8 +1154,7 @@ class BW:
         try:
             os.makedirs(os.path.dirname(STRUCTLOG_PATH), exist_ok=True)
             line = json.dumps({"ts": now(),
-                               "time": time.strftime("%Y-%m-%d %H:%M:%S",
-                                                     time.localtime()),
+                               "time": _kst_str(),
                                "cmd": cmd, "task_id": tid, "worker": self.idx,
                                "result": result}, ensure_ascii=True)
             with open(STRUCTLOG_PATH, "a", encoding="utf-8") as f:
@@ -1908,6 +1925,26 @@ class BW:
                     and str(hb.get("task_id") or "") == str(tid)
                     and now() - int(hb.get("updated_at", 0) or 0) < LIVE_HB_SECS)
 
+    def _master_stalled(self, tid, mc, rep, task):
+        """True if the master is live (fresh heartbeat) but making no
+        progress. This is the orphaned-hb-daemon case: the worker's agent
+        died, but its hb-daemon survived and keeps the claim looking
+        healthy, so the stale-heartbeat path never fires and the task
+        stalls forever. Checked in the supervise planning loop; a stalled
+        master is reclaimed and replaced like a dead one."""
+        if not mc:
+            return False
+        hb = self.heartbeat_of(mc.get("worker"))
+        if hb and hb.get("stalled"):
+            return True
+        try:
+            first = int((rep or {}).get("first_claimed_at") or 0)
+        except (ValueError, TypeError):
+            first = 0
+        tm = int((task or {}).get("timeout_minutes", 60) or 60)
+        prog_at = self._progress_at_remote(tid)
+        return self._is_stalled(tid, prog_at, first, tm)
+
     def _task_live_workers(self, tid):
         """Distinct workers holding a claim on tid with a fresh 'working on
         tid' heartbeat. Claims come from the synced local dir; heartbeats
@@ -2100,10 +2137,10 @@ class BW:
             "last_hb_at": hb_at, "last_progress_at": prog_at,
             "new_worker": new_worker})
         self._write_replacements(tid, rep)
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        ts = _kst_str()
 
         def _hm(v):
-            return time.strftime("%H:%M:%S", time.localtime(v)) if v else "-"
+            return _kst_hm(v)
 
         line = "%s | w%s | %s | hb=%s progress=%s | w%s" % (
             ts, prev_worker, reason, _hm(hb_at), _hm(prog_at), new_worker)
@@ -2127,8 +2164,7 @@ class BW:
                   % int(rep.get("count", 0))), "",
                  "## replacement history", ""]
         for h in rep.get("history", []):
-            at = time.strftime("%Y-%m-%d %H:%M:%S",
-                               time.localtime(h.get("at", 0)))
+            at = _kst_str("%Y-%m-%d %H:%M:%S", h.get("at", 0))
             lines.append("- %s: w%s -> w%s (%s)" % (
                 at, h.get("prev_worker"), h.get("new_worker"),
                 h.get("reason")))
@@ -2148,7 +2184,7 @@ class BW:
             scp_put(lp, BRIDGE + "/results/%s.md" % tid)
         except OSError:
             pass
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        ts = _kst_str()
         self._append_supervise_log(
             tid, "%s | - | failed_%s | - | -" % (ts, reason))
 
@@ -2229,6 +2265,7 @@ class BW:
             launching = sum(1 for e in intents if str(e.get("tid")) == tid)
             live = live_by_task[tid]
             mc = self._master_claim(tid)
+            stalled_prev = None  # worker idx of a stalled master we reclaimed
             if mc and self._master_live(tid, mc):
                 # master healthy: only refill genuinely free slots (no claim
                 # file and no part uploaded yet)
@@ -2246,6 +2283,35 @@ class BW:
                         and "%s.part-%d.md" % (tid, j) not in results]
                 short = max(0, len(free) - launching)
                 replacement = False
+                # A live-but-stalled master is NOT healthy: its agent died
+                # but the hb-daemon survived, so the heartbeat looks fresh
+                # while no progress is made. Reclaim the stale claim and
+                # replace the master; otherwise the task stalls forever.
+                rep = self._read_replacements(tid)
+                if self._master_stalled(tid, mc, rep, t):
+                    cn = tid + ".json"
+                    if ssh_del(BRIDGE + "/claims/" + cn):
+                        try:
+                            os.remove(os.path.join(self.dir, "claims", cn))
+                        except OSError:
+                            pass
+                        if rep is None:
+                            try:
+                                first = int(mc.get("first_claimed_at") or 0)
+                            except (ValueError, TypeError):
+                                first = 0
+                            rep = {"task_id": tid,
+                                   "first_claimed_at": first or now(),
+                                   "count": 0, "history": []}
+                            self._write_replacements(tid, rep)
+                        short = max(0, 1 - launching)
+                        replacement = True
+                        # remember the stalled master so the replacement
+                        # is journaled with reason="stalled" (not hb_silent)
+                        stalled_prev = mc.get("worker")
+                    # if the claim delete failed, leave the master alone;
+                    # a failed delete means the transport broke, not that
+                    # the worker is replaceable right now
             elif live:
                 # workers alive but no live master (orphaned slots): only a
                 # master is missing; one launch elects it and adopts them
@@ -2264,7 +2330,7 @@ class BW:
             if len(live) > needed:
                 self._append_supervise_log(
                     tid, "%s | %s | duplicate_dispatch | - | -" % (
-                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        _kst_str(),
                         ",".join("w%s" % w for w in sorted(live))))
             rep = self._read_replacements(tid)
             # a launch counts as a replacement when the task was claimed
@@ -2292,7 +2358,9 @@ class BW:
                     continue
                 # previous worker: the most recent launched worker that is
                 # no longer live (in the orphaned-master case that is the
-                # dead master, not a live slot worker)
+                # dead master, not a live slot worker). For a stalled
+                # master we reclaimed above, use its worker directly —
+                # history is empty on the first replacement.
                 hist = rep.get("history") or []
                 for h in reversed(hist):
                     w = h.get("new_worker")
@@ -2301,6 +2369,8 @@ class BW:
                         break
                 if prev_worker is None and hist:
                     prev_worker = hist[-1].get("new_worker")
+                if prev_worker is None and stalled_prev is not None:
+                    prev_worker = stalled_prev
                 reason, hb_at, prog_at = self._replacement_reason(
                     tid, prev_worker, rep, t)
             new_idxs = []

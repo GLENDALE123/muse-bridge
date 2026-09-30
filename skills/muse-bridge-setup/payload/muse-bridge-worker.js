@@ -23,6 +23,7 @@ function workerPrompt(i) {
     "\n" +
     "WORKSPACE - when a task needs you to create or modify files on home (existing files included):\n" +
     "  $BW ws-init <task_id> ; $BW ws-pull <task_id> <remote_path> [name] ; edit via $BW ws-get <task_id> <name> <localfile> then $BW ws-put <task_id> <localfile> <name> ; $BW ws-apply <task_id> <name> <remote_path>\n" +
+    "  ws-pull [name]: if you omit it, the cache name defaults to the original file name - USE THAT. Only pass an explicit [name] when two different remote paths have the same file name. Never invent short nicknames (ni-tsx, src-index); the cache name must match the file name so a replacement worker can find it.\n" +
     "  C:\\muse-workspace\\<task_id>\\ is your isolated staging area: modify freely there, nothing on home is touched until ws-apply.\n" +
     "  ws-apply always backs up the original (timestamped, per-task) and writes an audit-log entry (who/when/before-sha/after-sha). Inspect with $BW ws-log <task_id>, restore with $BW ws-revert <task_id> <remote_path> (latest backup), list with $BW ws-ls <task_id>, remove staging with $BW ws-clean <task_id> (backups+log are kept).\n" +
     "  Before each ws-apply batch, $BW claim-verify <task_id> must print {\"ok\": true} - never apply changes for a task you no longer own. ws-pull/ws-apply refresh your heartbeat automatically (at most every 5 min), but long stretches of local editing still need an explicit $BW heartbeat working <task_id> call every ~10 minutes.\n" +
@@ -68,6 +69,7 @@ function oneShotPrompt(i, tid) {
     "\n" +
     "WORKSPACE - when the task needs you to create or modify files on home (existing files included):\n" +
     "  $BW ws-init <task_id> ; $BW ws-pull <task_id> <remote_path> [name] ; edit via $BW ws-get <task_id> <name> <localfile> then $BW ws-put <task_id> <localfile> <name> ; $BW ws-apply <task_id> <name> <remote_path>\n" +
+    "  ws-pull [name]: if you omit it, the cache name defaults to the original file name - USE THAT. Only pass an explicit [name] when two different remote paths have the same file name. Never invent short nicknames (ni-tsx, src-index); the cache name must match the file name so a replacement worker can find it.\n" +
     "  C:\\muse-workspace\\<task_id>\\ is your isolated staging area: modify freely there, nothing on home is touched until ws-apply.\n" +
     "  ws-apply always backs up the original (timestamped, per-task) and writes an audit-log entry (who/when/before-sha/after-sha). Inspect with $BW ws-log <task_id>, restore with $BW ws-revert <task_id> <remote_path> (latest backup), list with $BW ws-ls <task_id>, remove staging with $BW ws-clean <task_id> (backups+log are kept).\n" +
     "  Before each ws-apply batch, $BW claim-verify <task_id> must print {\"ok\": true} - never apply changes for a task you no longer own. ws-pull/ws-apply refresh your heartbeat automatically (at most every 5 min), but long stretches of local editing still need an explicit $BW heartbeat working <task_id> call every ~2-3 minutes.\n" +
